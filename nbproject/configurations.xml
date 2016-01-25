@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configurationDescriptor version="51">
+  <logicalFolder name="root" displayName="root" projectFiles="true">
+    <logicalFolder name="HeaderFiles"
+                   displayName="Header Files"
+                   projectFiles="true">
+      <itemPath>planetarysystem.hpp</itemPath>
+      <itemPath>planetrender.hpp</itemPath>
+      <itemPath>simtypes.hpp</itemPath>
+    </logicalFolder>
+    <logicalFolder name="ResourceFiles"
+                   displayName="Resource Files"
+                   projectFiles="true">
+    </logicalFolder>
+    <logicalFolder name="SourceFiles"
+                   displayName="Source Files"
+                   projectFiles="true">
+      <itemPath>main.cpp</itemPath>
+      <itemPath>planetarysystem.cpp</itemPath>
+      <itemPath>planetrender.cpp</itemPath>
+    </logicalFolder>
+    <logicalFolder name="ExternalFiles"
+                   displayName="Important Files"
+                   projectFiles="false">
+      <itemPath>Makefile</itemPath>
+      <itemPath>solar_system.cfg</itemPath>
+    </logicalFolder>
+  </logicalFolder>
+  <projectmakefile>Makefile</projectmakefile>
+  <confs>
+    <conf name="Debug" type="1">
+      <toolsSet>
+        <developmentServer>localhost</developmentServer>
+        <compilerSet>GNU|GNU</compilerSet>
+        <platform>2</platform>
+      </toolsSet>
+      <compileType>
+        <ccCompilerTool>
+          <architecture>2</architecture>
+          <warningLevel>3</warningLevel>
+        </ccCompilerTool>
+        <linkerTool>
+          <commandlineTool>g++</commandlineTool>
+          <linkerLibItems>
+            <linkerLibStdlibItem>Mathematics</linkerLibStdlibItem>
+          </linkerLibItems>
+          <commandLine>-lSDL -lSDL_gfx -fopenmp</commandLine>
+        </linkerTool>
+      </compileType>
+      <item path="main.cpp">
+        <itemTool>1</itemTool>
+      </item>
+      <item path="planetarysystem.cpp">
+        <itemTool>1</itemTool>
+      </item>
+      <item path="planetarysystem.hpp">
+        <itemTool>3</itemTool>
+      </item>
+      <item path="planetrender.cpp">
+        <itemTool>1</itemTool>
+      </item>
+      <item path="planetrender.hpp">
+        <itemTool>3</itemTool>
+      </item>
+      <item path="simtypes.hpp">
+        <itemTool>3</itemTool>
+      </item>
+    </conf>
+    <conf name="Release" type="1">
+      <toolsSet>
+        <developmentServer>localhost</developmentServer>
+        <compilerSet>GNU|GNU</compilerSet>
+        <platform>2</platform>
+      </toolsSet>
+      <compileType>
+        <cCompilerTool>
+          <developmentMode>5</developmentMode>
+        </cCompilerTool>
+        <ccCompilerTool>
+          <developmentMode>6</developmentMode>
+          <stripSymbols>true</stripSymbols>
+          <architecture>2</architecture>
+          <commandLine>-O3 -funroll-all-loops -fopenmp</commandLine>
+        </ccCompilerTool>
+        <fortranCompilerTool>
+          <developmentMode>5</developmentMode>
+        </fortranCompilerTool>
+        <linkerTool>
+          <stripSymbols>true</stripSymbols>
+          <linkerLibItems>
+          </linkerLibItems>
+          <commandLine>-lSDL -lSDL_gfx</commandLine>
+        </linkerTool>
+      </compileType>
+      <item path="main.cpp">
+        <itemTool>1</itemTool>
+      </item>
+      <item path="planetarysystem.cpp">
+        <itemTool>1</itemTool>
+      </item>
+      <item path="planetarysystem.hpp">
+        <itemTool>3</itemTool>
+      </item>
+      <item path="planetrender.cpp">
+        <itemTool>1</itemTool>
+      </item>
+      <item path="planetrender.hpp">
+        <itemTool>3</itemTool>
+      </item>
+      <item path="simtypes.hpp">
+        <itemTool>3</itemTool>
+      </item>
+    </conf>
+  </confs>
+</configurationDescriptor>

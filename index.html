@@ -40,6 +40,7 @@
     <kbd>S</kbd> solar-system overlay &middot;
     <kbd>C</kbd> continuous source &middot;
     <kbd>F1</kbd>..<kbd>F4</kbd> resonance markers &middot;
+    <kbd>T</kbd> co-rotate frame (cycles Earth/Jupiter/off) &middot;
     <kbd>[</kbd>/<kbd>]</kbd> steps/frame &middot;
     <kbd>R</kbd> reset disk
   </div>
@@ -181,12 +182,19 @@ void main() { outColor = vec4(0.0); }   // unused: rasterizer is disabled
      into clip space using the centered body and current FOV. -->
 <script id="vs-render" type="x-shader/x-vertex">#version 300 es
 precision highp float;
-layout(location = 0) in vec2 a_pos;       // scaled position
+layout(location = 0) in vec2 a_pos;       // scaled position (inertial)
 uniform vec2 u_centerPos;                 // scaled
 uniform vec2 u_invFov;                    // 2 / (fov_scaled) per axis
+uniform vec2 u_rot;                       // (cos a, sin a); (1, 0) when off
 void main() {
-  vec2 ndc = (a_pos - u_centerPos) * u_invFov;
-  // Flip Y to match the SDL/Canvas2D convention (y grows downward).
+  // Camera offset, then optional rotation around the centered body to
+  // hold the chosen reference body fixed (e.g. for visualizing Trojans
+  // co-rotating with Jupiter).
+  vec2 d = a_pos - u_centerPos;
+  vec2 rotated = vec2(d.x * u_rot.x - d.y * u_rot.y,
+                      d.x * u_rot.y + d.y * u_rot.x);
+  vec2 ndc = rotated * u_invFov;
+  // Flip Y to match the Canvas2D convention (y grows downward).
   gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
   gl_PointSize = 1.0;
 }
@@ -364,6 +372,7 @@ class GPUSimulation {
     this.renU = {
       centerPos: gl.getUniformLocation(this.renProg, "u_centerPos"),
       invFov:    gl.getUniformLocation(this.renProg, "u_invFov"),
+      rot:       gl.getUniformLocation(this.renProg, "u_rot"),
     };
 
     // Annulus bounds (scaled).
@@ -508,7 +517,7 @@ class GPUSimulation {
     this.read = writeIdx;
   }
 
-  render(centerIdx, fovKm) {
+  render(centerIdx, fovKm, rotCos, rotSin) {
     const gl = this.gl;
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     gl.clearColor(0, 0, 0, 1);
@@ -520,6 +529,7 @@ class GPUSimulation {
     gl.uniform2f(this.renU.centerPos, cx, cy);
     const fovScaled = fovKm / L;
     gl.uniform2f(this.renU.invFov, 2 / fovScaled, 2 / fovScaled);
+    gl.uniform2f(this.renU.rot, rotCos, rotSin);
 
     gl.bindVertexArray(this.states[this.read].renVAO);
     gl.drawArrays(gl.POINTS, 0, this.n);
@@ -586,21 +596,49 @@ class OverlayRenderer {
     this.cy = this.h >> 1;
     this.fov = 2e9;
     this.center = 0;
+    this.coRotateIdx = -1;          // -1 = inertial; otherwise rotate so this body sits on +x of Sun
     this.resonance = 0;
     this.showSolarSystem = false;
     this.contSource = false;
     this.contX = 0; this.contY = 0;
-    this.stepsPerFrame = 4;          // GPU is fast — burn more steps/frame
+    this.stepsPerFrame = 4;
     this.fpsFrames = 0;
     this.fpsT0 = performance.now();
     this.frameFps = 0;
   }
   get scale() { return this.w / this.fov; }
 
+  // Cycle: off -> 1 -> 2 -> ... -> nP-1 -> off. Skip Sun (idx 0): a
+  // rotation around the Sun in the Sun's frame is meaningless.
+  cycleCoRotate() {
+    if (this.coRotateIdx < 0) {
+      this.coRotateIdx = this.sys.nP > 1 ? 1 : -1;
+    } else {
+      this.coRotateIdx = (this.coRotateIdx + 1 < this.sys.nP) ? this.coRotateIdx + 1 : -1;
+    }
+  }
+
+  // (cos a, sin a) where a = -theta and theta is the angle of the
+  // co-rotation target around the Sun. Multiplying world offsets by
+  // this rotation places the target on the +x axis relative to the Sun.
+  getRotation() {
+    if (this.coRotateIdx <= 0) return { c: 1, s: 0 };
+    const sys = this.sys;
+    const dx = sys.plX[this.coRotateIdx] - sys.plX[0];
+    const dy = sys.plY[this.coRotateIdx] - sys.plY[0];
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-9) return { c: 1, s: 0 };
+    return { c: dx / d, s: -dy / d };
+  }
+
   worldToScreen(x, y) {
     const s = this.sys, sc = this.scale;
-    return { x: this.cx + (x - s.plX[this.center]) * sc,
-             y: this.cy + (y - s.plY[this.center]) * sc };
+    const dx = x - s.plX[this.center];
+    const dy = y - s.plY[this.center];
+    const r = this.getRotation();
+    const rx = dx * r.c - dy * r.s;
+    const ry = dx * r.s + dy * r.c;
+    return { x: this.cx + rx * sc, y: this.cy + ry * sc };
   }
   setCenter(idx) { if (idx >= 0 && idx < this.sys.nP) this.center = idx; }
   toggleResonance(idx) { if (idx >= 0 && idx < this.sys.nP) this.resonance ^= (1 << idx); }
@@ -655,8 +693,8 @@ class OverlayRenderer {
                   778570000,1433530000,2872460000,4495060000];
     const names = ["Mercury","Venus","Earth","Mars","Jupiter","Saturn","Uranus","Neptune"];
     const ctx = this.ctx, s = this.sys;
-    const cx = this.cx + (s.plX[0] - s.plX[this.center]) * this.scale;
-    const cy = this.cy + (s.plY[0] - s.plY[this.center]) * this.scale;
+    const sun = this.worldToScreen(s.plX[0], s.plY[0]);
+    const cx = sun.x, cy = sun.y;
     ctx.lineWidth = 1; ctx.font = "11px Consolas, monospace";
     for (let i = 0; i < dist.length; ++i) {
       const r = dist[i] * this.scale;
@@ -676,8 +714,8 @@ class OverlayRenderer {
     const ratios = [1, 1/2, 1/3, 1/4, 2/3, 2/5];
     const names  = [" 1:1"," 2:1"," 3:1"," 4:1"," 3:2"," 5:2"];
     const G_SI = 6.67428e-11;
-    const cx = this.cx + (s.plX[idxMain] - s.plX[this.center]) * this.scale;
-    const cy = this.cy + (s.plY[idxMain] - s.plY[this.center]) * this.scale;
+    const main = this.worldToScreen(s.plX[idxMain], s.plY[idxMain]);
+    const cx = main.x, cy = main.y;
     ctx.strokeStyle = s.plColorCss[idx]; ctx.fillStyle = s.plColorCss[idx];
     ctx.lineWidth = 1; ctx.font = "11px Consolas, monospace";
     for (let i = 0; i < ratios.length; ++i) {
@@ -703,6 +741,7 @@ class OverlayRenderer {
       "Render FPS: " + Math.round(this.frameFps),
       "Steps/frame: " + this.stepsPerFrame,
       "Center: " + s.plName[this.center] + "   FOV: " + this.fov.toExponential(2) + " km",
+      "Co-rotate: " + (this.coRotateIdx < 0 ? "off (inertial)" : s.plName[this.coRotateIdx]),
     ];
     if (simStepsPerSec > 0) {
       const usPer = 1e6 / (simStepsPerSec * CONFIG.NUM_TRACERS);
@@ -754,8 +793,15 @@ cvCanvas.addEventListener("mousedown", (e) => {
   const rect = cvCanvas.getBoundingClientRect();
   const px = e.clientX - rect.left;
   const py = e.clientY - rect.top;
-  const wx = (px - overlay.cx) * overlay.fov / overlay.w + sys.plX[overlay.center];
-  const wy = (py - overlay.cy) * overlay.fov / overlay.h + sys.plY[overlay.center];
+  // Screen pixel -> rotated-world offset, then invert the rotation to
+  // get the inertial offset, then add the centered body's position.
+  const sx = (px - overlay.cx) * overlay.fov / overlay.w;
+  const sy = (py - overlay.cy) * overlay.fov / overlay.h;
+  const r = overlay.getRotation();
+  const dx =  sx * r.c + sy * r.s;
+  const dy = -sx * r.s + sy * r.c;
+  const wx = dx + sys.plX[overlay.center];
+  const wy = dy + sys.plY[overlay.center];
   sim.injectTracer(wx, wy, overlay.center);
   overlay.contX = wx; overlay.contY = wy;
 });
@@ -776,6 +822,7 @@ window.addEventListener("keydown", (e) => {
     case "F4": overlay.toggleResonance(3); e.preventDefault(); break;
     case "[":  overlay.stepsPerFrame = Math.max(1, overlay.stepsPerFrame - 1); break;
     case "]":  overlay.stepsPerFrame += 1; break;
+    case "t": case "T": overlay.cycleCoRotate(); break;
     case "r": case "R": sim.resetDisk(); break;
   }
 });
@@ -794,7 +841,8 @@ function loop() {
     stepsAcc = 0;
     stepsT0 = now;
   }
-  sim.render(overlay.center, overlay.fov);
+  const rot = overlay.getRotation();
+  sim.render(overlay.center, overlay.fov, rot.c, rot.s);
   overlay.render(stepsLastSec);
   overlay.bumpFrame();
   requestAnimationFrame(loop);

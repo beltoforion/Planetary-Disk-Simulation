@@ -630,15 +630,11 @@ class OverlayRenderer {
   }
 
   // World position the camera is anchored to. In co-rotation mode,
-  // anchor at the midpoint of the Sun and the co-rotation target so
-  // both lie symmetrically on the screen — handy for L4/L5 Trojans.
+  // anchor on the Sun so it stays at screen center while the chosen
+  // body sits on the +x axis (and the L4/L5 region is symmetric).
   getEffectiveCenter() {
     if (this.coRotateIdx > 0) {
-      const s = this.sys;
-      return {
-        x: 0.5 * (s.plX[0] + s.plX[this.coRotateIdx]),
-        y: 0.5 * (s.plY[0] + s.plY[this.coRotateIdx]),
-      };
+      return { x: this.sys.plX[0], y: this.sys.plY[0] };
     }
     return { x: this.sys.plX[this.center], y: this.sys.plY[this.center] };
   }

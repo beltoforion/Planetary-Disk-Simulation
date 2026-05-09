@@ -50,6 +50,13 @@
       <span id="eccVal" style="min-width:6em;">0.75 (e&approx;0.14)</span>
     </label>
     <span style="color:#888;"> &mdash; lower = let eccentric tracers live (Hildas survive); 0 = off.</span>
+    <br>
+    <label style="display:inline-flex; align-items:center; gap:8px; margin-top:4px;">
+      <span>Poynting-Robertson drag (small grains die first):</span>
+      <input id="prSlider" type="range" min="0" max="2000" step="1" value="0" style="width:200px;">
+      <span id="prVal" style="min-width:5em;">off</span>
+    </label>
+    <span style="color:#888;"> &mdash; tracer colour cyan&rarr;yellow encodes grain size (small&rarr;large).</span>
   </div>
 </div>
 
@@ -72,6 +79,7 @@ precision highp float;
 layout(location = 0) in vec2 a_pos;     // scaled position (Mm)
 layout(location = 1) in vec2 a_vel;     // scaled velocity (Mm/s)
 layout(location = 2) in vec2 a_stats;   // (minDist, maxDist) in scaled units
+layout(location = 3) in float a_size;   // grain size, normalized to [0,1] (small -> large)
 
 uniform vec2  u_planetPos[8];   // scaled
 uniform float u_planetMass[8];  // kg
@@ -85,10 +93,12 @@ uniform float u_Rmin;    // inner annulus radius, scaled
 uniform float u_Rmax;    // outer annulus radius, scaled
 uniform float u_seed;    // monotonically increasing per step
 uniform float u_eccGate; // perihelion/aphelion ratio below which a tracer is killed
+uniform float u_prCoef;  // PR-drag coefficient: -G*M_sun*dt / (c*L^2). 0 disables drag.
 
 out vec2 v_pos;
 out vec2 v_vel;
 out vec2 v_stats;
+out float v_size;
 
 // PCG hash. Uses only uint operations and uint shift counts.
 uint pcg(uint s) {
@@ -101,9 +111,11 @@ float rand01(uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
 // Pick a position uniformly in the annulus [u_Rmin, u_Rmax] around the
 // Sun (uniform area density, so no clustering near small radii) and
 // give it the corresponding circular orbital velocity.
-void doReset(uint id, float seed, out vec2 pos, out vec2 vel, out vec2 stats) {
+void doReset(uint id, float seed,
+             out vec2 pos, out vec2 vel, out vec2 stats, out float size) {
   uint h1 = id * 1973u + uint(seed * 977.0);
   uint h2 = h1 + 7919u;
+  uint h3 = h1 * 2654435761u + 13u;
   float u1 = rand01(h1);
   float u2 = rand01(h2);
   float angle = 6.28318530718 * u1;
@@ -116,6 +128,7 @@ void doReset(uint id, float seed, out vec2 pos, out vec2 vel, out vec2 stats) {
   pos   = newPos;
   vel   = newVel;
   stats = vec2(1.0e9, 0.0);
+  size  = rand01(h3);    // fresh random size on respawn
 }
 
 void main() {
@@ -127,6 +140,7 @@ void main() {
   vec2 pos = a_pos;
   vec2 vel = a_vel;
   vec2 stats = a_stats;
+  float size = a_size;
   uint id = uint(gl_VertexID);
 
   // Σ m_j * (r - rp_j) / |r - rp_j|^3   (sign baked into u_Kv).
@@ -146,12 +160,23 @@ void main() {
   }
 
   if (collided) {
-    doReset(id, u_seed, v_pos, v_vel, v_stats);
+    doReset(id, u_seed, v_pos, v_vel, v_stats, v_size);
     return;
   }
 
   // Leapfrog kick + drift.
   vec2 newVel = vel + u_Kv * acc;
+
+  // Poynting-Robertson drag: small particles spiral in, large ones don't.
+  // beta = u_prCoef-implied strength scaled by 1/size (clamped). The
+  // delta-v per step is approximately -beta * GM_sun*dt / (c*r^2) * v.
+  // u_prCoef already absorbs the GM_sun*dt/(c*L^2) constants.
+  if (u_prCoef > 0.0) {
+    float invR2 = 1.0 / (dist0 * dist0 + 1e-12);
+    float beta  = u_prCoef / max(size, 0.02);   // 0.02 floor avoids divide blow-up
+    newVel -= beta * invR2 * vel;
+  }
+
   vec2 newPos = pos + newVel * u_dt;
 
   // Perihelion/aphelion bookkeeping (relative to Sun).
@@ -163,18 +188,19 @@ void main() {
   vec2 sunPos = u_planetPos[0];
   if (newPos.x > sunPos.x && pos.x < sunPos.x && newPos.y > sunPos.y) {
     float exc = stats.x / max(stats.y, 1e-12);
-    if (exc < u_eccGate) { doReset(id, u_seed + 0.5, v_pos, v_vel, v_stats); return; }
+    if (exc < u_eccGate) { doReset(id, u_seed + 0.5, v_pos, v_vel, v_stats, v_size); return; }
     stats = vec2(1.0e9, 0.0);
   }
 
   // Cull tracers that escaped (or fell into the keep-out radius).
   float relDist = length(newPos - sunPos);
   if (relDist > u_Rmax || relDist < u_Rmin * 0.5) {
-    doReset(id, u_seed + 0.25, v_pos, v_vel, v_stats);
+    doReset(id, u_seed + 0.25, v_pos, v_vel, v_stats, v_size);
     return;
   }
 
   v_pos   = newPos;
+  v_size  = size;
   v_vel   = newVel;
   v_stats = stats;
 }
@@ -191,34 +217,37 @@ void main() { outColor = vec4(0.0); }   // unused: rasterizer is disabled
 <script id="vs-render" type="x-shader/x-vertex">#version 300 es
 precision highp float;
 layout(location = 0) in vec2 a_pos;       // scaled position (inertial)
+layout(location = 1) in float a_size;     // grain size in [0,1]
 uniform vec2 u_centerPos;                 // scaled
 uniform vec2 u_invFov;                    // 2 / (fov_scaled) per axis
 uniform vec2 u_rot;                       // (cos a, sin a); (1, 0) when off
+out float v_size;
 void main() {
-  // Camera offset, then optional rotation around the centered body to
-  // hold the chosen reference body fixed (e.g. for visualizing Trojans
-  // co-rotating with Jupiter).
   vec2 d = a_pos - u_centerPos;
   vec2 rotated = vec2(d.x * u_rot.x - d.y * u_rot.y,
                       d.x * u_rot.y + d.y * u_rot.x);
   vec2 ndc = rotated * u_invFov;
-  // Flip Y to match the Canvas2D convention (y grows downward).
   gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-  gl_PointSize = 9.0;
+  // Larger grains render slightly bigger so the visual cue stacks with
+  // the colour cue.
+  gl_PointSize = mix(6.0, 12.0, a_size);
+  v_size = clamp(a_size, 0.0, 1.0);
 }
 </script>
 
 <script id="fs-render" type="x-shader/x-fragment">#version 300 es
 precision highp float;
+in float v_size;
 out vec4 outColor;
-// Gaussian blob: low peak alpha + wide tails so overlapping tracers
-// fill the disk smoothly under additive blending. exp(-r^2/sigma^2)
-// with sigma ~0.3 (r is in [0, 0.5] across the point sprite).
+// Cool blue (small grains) -> warm yellow (large grains). Combined with
+// additive blending the surviving population's colour shifts visibly as
+// PR drag eats the small grains.
 void main() {
   vec2 c = gl_PointCoord - 0.5;
   float r2 = dot(c, c);
   float a = 0.18 * exp(-r2 * 11.0);
-  outColor = vec4(a, a, a, a);
+  vec3 col = mix(vec3(0.45, 0.65, 1.0), vec3(1.0, 0.85, 0.45), v_size);
+  outColor = vec4(col * a, a);
 }
 </script>
 
@@ -364,13 +393,14 @@ class GPUSimulation {
     this.read = 0;
     this.stepSeed = 0;
     this.eccGate  = 0.75;   // perihelion/aphelion cutoff for the kill gate
+    this.prScale  = 0;      // unitless dial for Poynting-Robertson drag (0 = off)
 
     // Compile programs.
     const vsInt = compileShader(gl, gl.VERTEX_SHADER,   shaderSrc("vs-integrate"));
     const fsInt = compileShader(gl, gl.FRAGMENT_SHADER, shaderSrc("fs-integrate"));
     const vsRen = compileShader(gl, gl.VERTEX_SHADER,   shaderSrc("vs-render"));
     const fsRen = compileShader(gl, gl.FRAGMENT_SHADER, shaderSrc("fs-render"));
-    this.intProg = linkProgram(gl, vsInt, fsInt, ["v_pos", "v_vel", "v_stats"]);
+    this.intProg = linkProgram(gl, vsInt, fsInt, ["v_pos", "v_vel", "v_stats", "v_size"]);
     this.renProg = linkProgram(gl, vsRen, fsRen, null);
 
     // Cache uniform locations.
@@ -386,6 +416,7 @@ class GPUSimulation {
       Rmax:         gl.getUniformLocation(this.intProg, "u_Rmax"),
       seed:         gl.getUniformLocation(this.intProg, "u_seed"),
       eccGate:      gl.getUniformLocation(this.intProg, "u_eccGate"),
+      prCoef:       gl.getUniformLocation(this.intProg, "u_prCoef"),
     };
     this.renU = {
       centerPos: gl.getUniformLocation(this.renProg, "u_centerPos"),
@@ -400,9 +431,10 @@ class GPUSimulation {
     // Allocate ping-pong state buffers (sized but contents replaced
     // immediately below).
     const empty = new Float32Array(n * 2);
+    const empty1 = new Float32Array(n);
     this.states = [
-      this._createState(empty, empty, empty),
-      this._createState(empty, empty, empty),
+      this._createState(empty, empty, empty, empty1),
+      this._createState(empty, empty, empty, empty1),
     ];
     // Identical to what 'R' does: re-upload fresh initial data into
     // every buffer after TF bindings exist. Doing it this way at boot
@@ -415,7 +447,7 @@ class GPUSimulation {
   // sqrt(Rmin^2 + u*(Rmax^2 - Rmin^2)). The CPU-side initial state and
   // the GPU-side reset both use this distribution so the disk stays
   // statistically uniform across resets.
-  _initTracerData(pos, vel, stats) {
+  _initTracerData(pos, vel, stats, size) {
     const sunXkm = this.sys.plX[0], sunYkm = this.sys.plY[0];
     const RminKm = this.Rmin * L, RmaxKm = this.Rmax * L;
     const Rmin2 = RminKm * RminKm, Rmax2 = RmaxKm * RmaxKm;
@@ -432,10 +464,11 @@ class GPUSimulation {
       vel[2*i + 1] = v.vy / L;
       stats[2*i]     = 1e9;
       stats[2*i + 1] = 0;
+      size[i]        = Math.random();   // uniform grain "size" in [0,1]
     }
   }
 
-  _createState(initPos, initVel, initStats) {
+  _createState(initPos, initVel, initStats, initSize) {
     const gl = this.gl;
     const mkBuf = (data) => {
       const b = gl.createBuffer();
@@ -446,6 +479,7 @@ class GPUSimulation {
     const posBuf   = mkBuf(initPos);
     const velBuf   = mkBuf(initVel);
     const statsBuf = mkBuf(initStats);
+    const sizeBuf  = mkBuf(initSize);
 
     const intVAO = gl.createVertexArray();
     gl.bindVertexArray(intVAO);
@@ -458,6 +492,9 @@ class GPUSimulation {
     gl.bindBuffer(gl.ARRAY_BUFFER, statsBuf);
     gl.enableVertexAttribArray(2);
     gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuf);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
     const renVAO = gl.createVertexArray();
@@ -465,6 +502,9 @@ class GPUSimulation {
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuf);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
     const tf = gl.createTransformFeedback();
@@ -472,9 +512,10 @@ class GPUSimulation {
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, posBuf);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, velBuf);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 2, statsBuf);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 3, sizeBuf);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
 
-    return { posBuf, velBuf, statsBuf, intVAO, renVAO, tf };
+    return { posBuf, velBuf, statsBuf, sizeBuf, intVAO, renVAO, tf };
   }
 
   step() {
@@ -514,6 +555,11 @@ class GPUSimulation {
     gl.uniform1f(this.intU.Rmax, this.Rmax);
     gl.uniform1f(this.intU.seed, this.stepSeed);
     gl.uniform1f(this.intU.eccGate, this.eccGate);
+    // Poynting-Robertson coefficient: GM_sun*dt/(c*L^2), times the user
+    // dial. Speed of light c = 299792.458 km/s.
+    const C_KMS = 299792.458;
+    const prCoefBase = (GAMMA * sys.plMass[0] * sys.dt) / (C_KMS * L * L);
+    gl.uniform1f(this.intU.prCoef, this.prScale * prCoefBase);
 
     gl.bindVertexArray(this.states[this.read].intVAO);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, this.states[writeIdx].tf);
@@ -586,6 +632,10 @@ class GPUSimulation {
     const tmp2 = new Float32Array([1e9, 0]);
     gl.bindBuffer(gl.ARRAY_BUFFER, st.statsBuf);
     gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp2);
+    // Pick a random size for the injected tracer.
+    const tmp3 = new Float32Array([Math.random()]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.sizeBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, i * 4, tmp3);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
   }
 
@@ -594,7 +644,8 @@ class GPUSimulation {
     const initPos   = new Float32Array(this.n * 2);
     const initVel   = new Float32Array(this.n * 2);
     const initStats = new Float32Array(this.n * 2);
-    this._initTracerData(initPos, initVel, initStats);
+    const initSize  = new Float32Array(this.n);
+    this._initTracerData(initPos, initVel, initStats, initSize);
     const gl = this.gl;
     for (const st of this.states) {
       gl.bindBuffer(gl.ARRAY_BUFFER, st.posBuf);
@@ -603,6 +654,8 @@ class GPUSimulation {
       gl.bufferData(gl.ARRAY_BUFFER, initVel, gl.DYNAMIC_COPY);
       gl.bindBuffer(gl.ARRAY_BUFFER, st.statsBuf);
       gl.bufferData(gl.ARRAY_BUFFER, initStats, gl.DYNAMIC_COPY);
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.sizeBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, initSize, gl.DYNAMIC_COPY);
     }
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
   }
@@ -861,6 +914,22 @@ updateEccLabel();
 eccSlider.addEventListener("input", () => {
   sim.eccGate = parseFloat(eccSlider.value);
   updateEccLabel();
+});
+
+// PR-drag slider. Maps the 0..2000 widget range into a unitless prScale
+// such that values around 100-500 give visible spiral-in over a few
+// minutes of wall-clock time at the default step rate.
+const prSlider = document.getElementById("prSlider");
+const prVal    = document.getElementById("prVal");
+function updatePrLabel() {
+  const v = sim.prScale;
+  prVal.textContent = v === 0 ? "off" : v.toFixed(0);
+}
+prSlider.value = sim.prScale;
+updatePrLabel();
+prSlider.addEventListener("input", () => {
+  sim.prScale = parseFloat(prSlider.value);
+  updatePrLabel();
 });
 
 window.addEventListener("keydown", (e) => {

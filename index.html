@@ -513,9 +513,12 @@ class GPUSimulation {
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
     gl.bindVertexArray(null);
 
-    // Surface any GL error on the very first step so we don't silently
-    // limp along producing garbage. Cleared once non-zero, then we stop
-    // checking to avoid stalling the pipeline every step.
+    // Force the driver to actually execute submitted work. Without this
+    // some drivers were sitting on the TF dispatch indefinitely until
+    // something else (a bufferSubData from a click, etc.) triggered a
+    // sync, which is what made tracers "need a click to start".
+    gl.flush();
+
     if (this._checkError !== false) {
       const err = gl.getError();
       if (err) { this.lastGlError = err; this._checkError = false; }
@@ -607,12 +610,13 @@ class OverlayRenderer {
     this.cy = this.h >> 1;
     this.fov = 2e9;
     this.center = 0;
-    this.coRotateIdx = -1;          // -1 = inertial; otherwise rotate so this body sits on +x of Sun
+    // Default to co-rotating with Jupiter (last planet) if present.
+    this.coRotateIdx = sys.nP > 2 ? 2 : (sys.nP > 1 ? 1 : -1);
     this.resonance = 0;
     this.showSolarSystem = false;
     this.contSource = false;
     this.contX = 0; this.contY = 0;
-    this.stepsPerFrame = 4;
+    this.stepsPerFrame = 100;
     this.fpsFrames = 0;
     this.fpsT0 = performance.now();
     this.frameFps = 0;
@@ -809,6 +813,13 @@ if (!gl) {
 const sys = new PlanetarySystem(CONFIG);
 const sim = new GPUSimulation(gl, sys, CONFIG.NUM_TRACERS);
 const overlay = new OverlayRenderer(cvCanvas, sys);
+
+// Synchronously warm up the GPU pipeline before the rAF loop hands
+// control back to the browser. Drives the integration shader once and
+// forces a sync so the driver actually executes the work instead of
+// queueing it indefinitely.
+sim.step();
+gl.finish();
 
 // --- input ---------------------------------------------------------
 cvCanvas.addEventListener("mousedown", (e) => {

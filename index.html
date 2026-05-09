@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Planetary Disk Simulation</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #fff;
+               font-family: Consolas, "Courier New", monospace; height: 100%; }
+  #wrap { display: flex; flex-direction: column; align-items: center; }
+  canvas { background: #000; display: block; cursor: crosshair;
+           image-rendering: pixelated; }
+  #help { max-width: 800px; padding: 8px 12px; font-size: 12px;
+          color: #bbb; line-height: 1.4; }
+  #help b { color: #fff; }
+  #help kbd { background: #222; border: 1px solid #444; padding: 0 4px;
+              border-radius: 3px; color: #fff; }
+  a { color: #6cf; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="800" height="800"></canvas>
+  <div id="help">
+    <b>Planetary Disk Simulation</b> &mdash; 2D Verlet integration of a
+    dust disk perturbed by Jupiter. Original C++/SDL by beltoforion;
+    browser port runs the same physics in JavaScript.
+    <br>
+    <b>Controls:</b>
+    click to inject a tracer at the cursor &middot;
+    <kbd>+</kbd>/<kbd>-</kbd> zoom &middot;
+    <kbd>1</kbd>..<kbd>4</kbd> center on planet &middot;
+    <kbd>S</kbd> solar-system overlay &middot;
+    <kbd>C</kbd> continuous tracer source at last click &middot;
+    <kbd>F1</kbd>..<kbd>F4</kbd> toggle resonance markers around planet i &middot;
+    <kbd>[</kbd>/<kbd>]</kbd> physics steps per frame &middot;
+    <kbd>R</kbd> reset disk
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ===================================================================
+// Simulation configuration (mirrors solar_system.cfg)
+// ===================================================================
+const CONFIG = {
+  DELTA_T: 20000,           // seconds per integration step
+  NUM_TRACERS: 30000,       // dust particles
+  DISK_RADIUS: 1e9,         // km
+  PLANETS: [
+    { name: "Sun",     rad: 695700, mass: 1.989e30,
+      orbit: null, color: "rgba(255,255,255,1)" },
+    { name: "Earth",   rad: 6378,   mass: 5.974e24,
+      orbit: { around: "Sun", elonDeg: -90, dist: 149600000 },
+      color: "rgba(0,123,98,1)" },
+    { name: "Jupiter", rad: 71492,  mass: 1.899e27,
+      orbit: { around: "Sun", elonDeg: 0,   dist: 778570000 },
+      color: "rgba(255,97,35,1)" },
+    // Saturn (commented out in original cfg). Enable to add a 4th body:
+    // { name: "Saturn", rad: 30134, mass: 5.69e26,
+    //   orbit: { around: "Sun", elonDeg: 180, dist: 1425688000 },
+    //   color: "rgba(255,216,0,1)" },
+  ],
+};
+
+const GAMMA   = 6.67428e-20; // km^3 / (kg * s^2)  -- positions are in km
+const DEG2RAD = Math.PI / 180;
+
+// ===================================================================
+// Planetary system (physics)
+// ===================================================================
+class PlanetarySystem {
+  constructor(cfg) {
+    this.dt = cfg.DELTA_T;
+    this.time = 0;
+    this.steps = 0;
+    this.fps = 0;
+    this._frameCount = 0;
+    this._frameT0 = performance.now();
+
+    // Planets stored as parallel arrays for tight loops.
+    const n = cfg.PLANETS.length;
+    this.nP = n;
+    this.plX  = new Float64Array(n);
+    this.plY  = new Float64Array(n);
+    this.plOX = new Float64Array(n);
+    this.plOY = new Float64Array(n);
+    this.plVX = new Float64Array(n);
+    this.plVY = new Float64Array(n);
+    this.plAX = new Float64Array(n);
+    this.plAY = new Float64Array(n);
+    this.plMass = new Float64Array(n);
+    this.plRad  = new Float64Array(n);
+    this.plName = [];
+    this.plColor = [];
+
+    for (let i = 0; i < n; ++i) {
+      const p = cfg.PLANETS[i];
+      this.plName.push(p.name);
+      this.plColor.push(p.color);
+      this.plMass[i] = p.mass;
+      this.plRad[i]  = p.rad;
+
+      if (p.orbit) {
+        // Find the parent body by name.
+        const j = this.plName.indexOf(p.orbit.around);
+        if (j < 0) throw new Error("Unknown orbit reference: " + p.orbit.around);
+        const elon = p.orbit.elonDeg * DEG2RAD;
+        const x = p.orbit.dist * Math.sin(elon);
+        const y = p.orbit.dist * Math.cos(elon);
+        this.plX[i] = x;
+        this.plY[i] = y;
+        const v = this._orbitalVel(j, x, y);
+        this.plVX[i] = v.vx;
+        this.plVY[i] = v.vy;
+      } else {
+        this.plX[i] = 0;
+        this.plY[i] = 0;
+      }
+    }
+
+    // Seed previous positions for Verlet (one step back).
+    for (let i = 0; i < n; ++i) {
+      this.plOX[i] = this.plX[i] - this.dt * this.plVX[i];
+      this.plOY[i] = this.plY[i] - this.dt * this.plVY[i];
+    }
+
+    this.bDoReset = true;
+    this.xmin = 0; this.xmax = 0; this.ymin = 0; this.ymax = 0;
+    this.center = 0;
+
+    this._initTracerArrays(0);
+  }
+
+  _initTracerArrays(num) {
+    this.nT = num;
+    this.nActive = num;
+    this.trX  = new Float64Array(num);
+    this.trY  = new Float64Array(num);
+    this.trOX = new Float64Array(num);
+    this.trOY = new Float64Array(num);
+    this.trAX = new Float64Array(num);
+    this.trAY = new Float64Array(num);
+    this.trMin = new Float64Array(num); this.trMin.fill(9e29);
+    this.trMax = new Float64Array(num);
+    this.trExc = new Float64Array(num); this.trExc.fill(1);
+  }
+
+  initTracerRandom(num, rad) {
+    this._initTracerArrays(num);
+    const sunSpc = this.plRad[0] * 20;
+    rad = rad - sunSpc;
+
+    for (let i = 0; i < num; ++i) {
+      const dist = sunSpc + rad * Math.random();
+      const elon = 2 * Math.PI * Math.random();
+      const x = this.plX[0] + dist * Math.cos(elon);
+      const y = this.plY[0] + dist * Math.sin(elon);
+      this.trX[i] = x;
+      this.trY[i] = y;
+      const v = this._orbitalVel(0, x, y);
+      this.trOX[i] = x - this.dt * v.vx;
+      this.trOY[i] = y - this.dt * v.vy;
+    }
+
+    this.xmin = this.plX[0] - rad;
+    this.xmax = this.plX[0] + rad;
+    this.ymin = this.plY[0] - rad;
+    this.ymax = this.plY[0] + rad;
+  }
+
+  _orbitalVel(idxMain, x, y) {
+    const rx = x - this.plX[idxMain];
+    const ry = y - this.plY[idxMain];
+    const dist = Math.sqrt(rx * rx + ry * ry);
+    const v = Math.sqrt(GAMMA * this.plMass[idxMain] / dist);
+    return { vx: ( ry / dist) * v, vy: (-rx / dist) * v };
+  }
+
+  setTracerTo(x, y) {
+    if (this.nT === 0) return;
+    if (this._injectIdx === undefined) this._injectIdx = 0;
+    this._injectIdx = (this._injectIdx + 1) % this.nT;
+    const i = this._injectIdx;
+    const v = this._orbitalVel(this.center, x, y);
+    this.trX[i] = x;
+    this.trY[i] = y;
+    this.trOX[i] = x - this.dt * v.vx;
+    this.trOY[i] = y - this.dt * v.vy;
+  }
+
+  _resetTracer(i) {
+    if (!this.bDoReset) {
+      // Swap-and-shrink: copy last active tracer to slot i.
+      const k = --this.nActive;
+      this.trX[i]  = this.trX[k];
+      this.trY[i]  = this.trY[k];
+      this.trOX[i] = this.trOX[k];
+      this.trOY[i] = this.trOY[k];
+      this.trAX[i] = this.trAX[k];
+      this.trAY[i] = this.trAY[k];
+      this.trMin[i] = this.trMin[k];
+      this.trMax[i] = this.trMax[k];
+      this.trExc[i] = this.trExc[k];
+    } else {
+      const xrng = this.xmax - this.xmin;
+      const yrng = this.ymax - this.ymin;
+      const x = this.xmin + xrng * Math.random();
+      const y = this.ymin + yrng * Math.random();
+      const v = this._orbitalVel(0, x, y);
+      this.trX[i]  = x;
+      this.trY[i]  = y;
+      this.trOX[i] = x - this.dt * v.vx;
+      this.trOY[i] = y - this.dt * v.vy;
+      this.trAX[i] = 0;
+      this.trAY[i] = 0;
+      this.trMin[i] = 9e19;
+      this.trMax[i] = -9e19;
+      this.trExc[i] = 1;
+    }
+  }
+
+  _movePlanets() {
+    const n = this.nP;
+    const ax = this.plAX, ay = this.plAY;
+    for (let i = 0; i < n; ++i) { ax[i] = 0; ay[i] = 0; }
+
+    for (let i = 0; i < n; ++i) {
+      for (let j = i + 1; j < n; ++j) {
+        const rx = this.plX[i] - this.plX[j];
+        const ry = this.plY[i] - this.plY[j];
+        const d2 = rx * rx + ry * ry;
+        const d  = Math.sqrt(d2);
+        const k  = -GAMMA * this.plMass[i] * this.plMass[j] / (d2 * d);
+        const fx = k * rx, fy = k * ry;
+        ax[i] += fx / this.plMass[i];
+        ay[i] += fy / this.plMass[i];
+        ax[j] -= fx / this.plMass[j];
+        ay[j] -= fy / this.plMass[j];
+      }
+    }
+
+    const dt2 = this.dt * this.dt;
+    for (let i = 0; i < n; ++i) {
+      const bx = this.plX[i], by = this.plY[i];
+      this.plX[i] = 2 * bx - this.plOX[i] + ax[i] * dt2;
+      this.plY[i] = 2 * by - this.plOY[i] + ay[i] * dt2;
+      this.plOX[i] = bx;
+      this.plOY[i] = by;
+    }
+  }
+
+  _moveTracers() {
+    // Verlet integration of each tracer in the field of the planets.
+    // Toleration of roundtrip-style "eccentricity" estimate matches the
+    // original: when a tracer crosses behind the sun on the +x/+y side,
+    // we evaluate min/max distance and reset particles below the cutoff.
+    const n = this.nActive;
+    const dt2 = this.dt * this.dt;
+    const sunX = this.plX[0], sunY = this.plY[0];
+    const sunOX = this.plOX[0], sunOY = this.plOY[0];
+
+    // Hoist planet data into locals so the inner loop touches no `this`.
+    const nP = this.nP;
+    const pX = this.plX, pY = this.plY, pM = this.plMass, pR = this.plRad;
+
+    for (let i = 0; i < n; ++i) {
+      let axi = 0, ayi = 0, dist0 = 0, collided = false;
+      const xi = this.trX[i], yi = this.trY[i];
+
+      for (let j = 0; j < nP; ++j) {
+        const rx = xi - pX[j];
+        const ry = yi - pY[j];
+        const d2 = rx * rx + ry * ry;
+        const d  = Math.sqrt(d2);
+        const g  = pM[j] / (d2 * d);
+        if (j === 0) dist0 = d;
+        axi += g * rx;
+        ayi += g * ry;
+        if (d < pR[j] * 10) { collided = true; break; }
+      }
+
+      if (collided) { this._resetTracer(i); continue; }
+
+      axi *= -GAMMA;
+      ayi *= -GAMMA;
+
+      const bx = xi, by = yi;
+      const nx = 2 * xi - this.trOX[i] + axi * dt2;
+      const ny = 2 * yi - this.trOY[i] + ayi * dt2;
+      this.trX[i]  = nx;
+      this.trY[i]  = ny;
+      this.trOX[i] = bx;
+      this.trOY[i] = by;
+
+      if (dist0 < this.trMin[i]) this.trMin[i] = dist0;
+      if (dist0 > this.trMax[i]) this.trMax[i] = dist0;
+
+      // Once-per-orbit eccentricity gate.
+      if (nx > sunX && bx < sunOX && ny > sunY) {
+        const exc = this.trMin[i] / this.trMax[i];
+        this.trExc[i] = exc;
+        this.trMin[i] = 9e29;
+        this.trMax[i] = 0;
+        if (exc < 0.75) { this._resetTracer(i); continue; }
+      }
+
+      // Bounding-box cull (relative to the sun).
+      if (nx < sunX + this.xmin || nx > sunX + this.xmax ||
+          ny < sunY + this.ymin || ny > sunY + this.ymax) {
+        this._resetTracer(i);
+      }
+    }
+  }
+
+  step() {
+    this._movePlanets();
+    this._moveTracers();
+    this.time += this.dt;
+    this.steps += 1;
+    this._frameCount += 1;
+    const now = performance.now();
+    const dtMs = now - this._frameT0;
+    if (dtMs > 1000) {
+      this.fps = this._frameCount / (dtMs * 0.001);
+      this._frameCount = 0;
+      this._frameT0 = now;
+    }
+  }
+}
+
+// ===================================================================
+// Renderer (Canvas 2D port of the SDL renderer)
+// ===================================================================
+class Renderer {
+  constructor(canvas, sys) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.sys = sys;
+    this.w = canvas.width;
+    this.h = canvas.height;
+    this.cx = this.w >> 1;
+    this.cy = this.h >> 1;
+    this.fov = 2e9;
+    this._updateScale();
+    this.center = 0;
+    this.resonance = 0;             // bitmask: which planets show resonance rings
+    this.showSolarSystem = false;
+    this.contSource = false;
+    this.contX = 0; this.contY = 0;
+    this.stepsPerFrame = 1;
+  }
+
+  _updateScale() { this.scale = this.w / this.fov; }
+
+  worldToScreen(x, y) {
+    const s = this.sys;
+    return {
+      x: this.cx + (x - s.plX[this.center]) * this.scale,
+      y: this.cy + (y - s.plY[this.center]) * this.scale,
+    };
+  }
+
+  screenToWorld(px, py) {
+    return {
+      x: (px - this.cx) * this.fov / this.w,
+      y: (py - this.cy) * this.fov / this.h,
+    };
+  }
+
+  setCenter(idx) {
+    if (idx >= 0 && idx < this.sys.nP) this.center = idx;
+  }
+
+  toggleResonance(idx) {
+    if (idx >= 0 && idx < this.sys.nP) this.resonance ^= (1 << idx);
+  }
+
+  zoom(factor) {
+    this.fov *= factor;
+    this._updateScale();
+  }
+
+  // -- main render -------------------------------------------------
+  render() {
+    const ctx = this.ctx;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, this.w, this.h);
+
+    this._drawAxes();
+    this._drawPlanets();
+
+    for (let i = 0; i < this.sys.nP; ++i) {
+      if (this.resonance & (1 << i)) this._drawResonance(i);
+    }
+
+    if (this.showSolarSystem) this._drawSolarSystem();
+
+    this._drawTracers();
+    this._drawStat();
+  }
+
+  _drawAxes() {
+    const ctx = this.ctx;
+    ctx.strokeStyle = "rgba(68,68,170,1)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(this.cx + 0.5, 0);
+    ctx.lineTo(this.cx + 0.5, this.h);
+    ctx.moveTo(0, this.cy + 0.5);
+    ctx.lineTo(this.w, this.cy + 0.5);
+    ctx.stroke();
+  }
+
+  _drawPlanets() {
+    const s = this.sys;
+    const ctx = this.ctx;
+    for (let i = 0; i < s.nP; ++i) {
+      const p = this.worldToScreen(s.plX[i], s.plY[i]);
+      if (p.x < 0 || p.x > this.w || p.y < 0 || p.y > this.h) continue;
+
+      const col = s.plColor[i];
+      ctx.strokeStyle = col;
+      ctx.fillStyle   = col;
+      ctx.lineWidth = 1;
+
+      // Crosshair (planet picker), like SDL version.
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y - 15); ctx.lineTo(p.x, p.y + 15);
+      ctx.moveTo(p.x - 15, p.y); ctx.lineTo(p.x + 15, p.y);
+      ctx.stroke();
+
+      // Filled disk sized by the planet's actual radius.
+      const r = Math.max(1, s.plRad[i] * this.scale);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  _drawSolarSystem() {
+    // Reference: average orbital radii of the real solar system,
+    // drawn as concentric circles around the Sun for scale.
+    const cols = [
+      "rgba(255,255,255,1)", "rgba(251,230,111,1)", "rgba(0,123,98,1)",
+      "rgba(242,98,42,1)",   "rgba(255,97,35,1)",   "rgba(255,216,0,1)",
+      "rgba(101,144,255,1)", "rgba(5,54,178,1)"
+    ];
+    const dist = [57910000, 108210000, 149600000, 227920000,
+                  778570000, 1433530000, 2872460000, 4495060000];
+    const names = ["Mercury","Venus","Earth","Mars",
+                   "Jupiter","Saturn","Uranus","Neptune"];
+    const ctx = this.ctx;
+    const s = this.sys;
+    const cx = this.cx + (s.plX[0] - s.plX[this.center]) * this.scale;
+    const cy = this.cy + (s.plY[0] - s.plY[this.center]) * this.scale;
+
+    ctx.lineWidth = 1;
+    ctx.font = "11px Consolas, monospace";
+    for (let i = 0; i < dist.length; ++i) {
+      const r = dist[i] * this.scale;
+      ctx.strokeStyle = cols[i];
+      ctx.fillStyle = cols[i];
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.fillText(names[i], cx, cy + r - 2);
+    }
+  }
+
+  _drawResonance(idx) {
+    // Mean-motion resonances of `idx` with the central body (Sun = 0).
+    // Same set of ratios as the original: 1:1, 2:1, 3:1, 4:1, 3:2, 5:2.
+    const s = this.sys;
+    const ctx = this.ctx;
+    const idxMain = 0;
+
+    const rx = s.plX[idxMain] - s.plX[idx];
+    const ry = s.plY[idxMain] - s.plY[idx];
+    const dist = Math.sqrt(rx * rx + ry * ry);
+
+    // Velocity for circular orbit at that radius -> orbital period.
+    const v = Math.sqrt(GAMMA * s.plMass[idxMain] / dist);
+    const period = 2 * Math.PI * dist / v; // seconds
+    const ratios = [1, 1/2, 1/3, 1/4, 2/3, 2/5];
+    const names  = [" 1:1", " 2:1", " 3:1", " 4:1", " 3:2", " 5:2"];
+
+    // Note: the original computes the resonance radius using
+    // GAMMA in m^3/(kg s^2) and divides by 1000, which works out to
+    // give a result in the same length units as everything else (km).
+    const G_SI = 6.67428e-11;
+    const cx = this.cx + (s.plX[idxMain] - s.plX[this.center]) * this.scale;
+    const cy = this.cy + (s.plY[idxMain] - s.plY[this.center]) * this.scale;
+    ctx.strokeStyle = s.plColor[idx];
+    ctx.fillStyle   = s.plColor[idx];
+    ctx.lineWidth = 1;
+    ctx.font = "11px Consolas, monospace";
+
+    for (let i = 0; i < ratios.length; ++i) {
+      const T = period * ratios[i];
+      const rad = Math.cbrt(G_SI * s.plMass[idxMain] * T * T / (4 * Math.PI * Math.PI)) / 1000;
+      const rPx = rad * this.scale;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rPx, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.fillText(names[i], cx, cy - rPx - 4);
+    }
+  }
+
+  _drawTracers() {
+    const s = this.sys;
+    const img = this.ctx.getImageData(0, 0, this.w, this.h);
+    const data = img.data;
+    const cxw = s.plX[this.center];
+    const cyw = s.plY[this.center];
+    const w = this.w, h = this.h, scale = this.scale;
+    const cx = this.cx, cy = this.cy;
+    const n = s.nActive;
+    const tx = s.trX, ty = s.trY;
+
+    for (let i = 0; i < n; ++i) {
+      const px = (cx + (tx[i] - cxw) * scale) | 0;
+      const py = (cy + (ty[i] - cyw) * scale) | 0;
+      if (px <= 0 || px >= w || py <= 0 || py >= h) continue;
+      const o = (py * w + px) * 4;
+      data[o]     = 255;
+      data[o + 1] = 255;
+      data[o + 2] = 255;
+      data[o + 3] = 255;
+    }
+    this.ctx.putImageData(img, 0, 0);
+  }
+
+  _drawStat() {
+    const s = this.sys;
+    const ctx = this.ctx;
+    ctx.font = "12px Consolas, monospace";
+    ctx.fillStyle = "#fff";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+
+    const yr = s.time / (86400 * 365.25);
+    const lines = [
+      "Number of tracers: " + s.nActive,
+      "Total time: " + yr.toFixed(2) + " yr",
+      "Steps per second: " + Math.round(s.fps),
+    ];
+    if (s.fps > 0) {
+      const usPer = 1e6 / (s.fps * Math.max(1, s.nActive));
+      lines.push("Time per tracer: " + usPer.toPrecision(2) + " us");
+    }
+    lines.push("Steps/frame: " + this.stepsPerFrame);
+    lines.push("Center: " + s.plName[this.center] +
+               "   FOV: " + this.fov.toExponential(2) + " km");
+
+    for (let i = 0; i < lines.length; ++i) {
+      ctx.fillText(lines[i], 12, 12 + 15 * i);
+    }
+
+    // Resonance legend.
+    if (this.resonance) {
+      let txt = "Resonances: ";
+      for (let i = 0; i < s.nP; ++i) {
+        if (this.resonance & (1 << i)) txt += s.plName[i] + " ";
+      }
+      ctx.fillText(txt, 12, 12 + 15 * lines.length);
+    }
+  }
+}
+
+// ===================================================================
+// Wire it up
+// ===================================================================
+const canvas = document.getElementById("cv");
+const sys = new PlanetarySystem(CONFIG);
+sys.initTracerRandom(CONFIG.NUM_TRACERS, CONFIG.DISK_RADIUS);
+sys.bDoReset = true; // matches main.cpp: DoTracerReset(true)
+const renderer = new Renderer(canvas, sys);
+
+// --- input ----------------------------------------------------------
+canvas.addEventListener("mousedown", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  // Click placement: map screen pixel to world coords *relative to the
+  // currently centered body*, so a click at the cursor lands at the
+  // cursor regardless of which planet is centered. (The original SDL
+  // version omitted the center offset and was sometimes surprising.)
+  const wx = (px - renderer.cx) * renderer.fov / renderer.w + sys.plX[renderer.center];
+  const wy = (py - renderer.cy) * renderer.fov / renderer.h + sys.plY[renderer.center];
+  sys.setTracerTo(wx, wy);
+  renderer.contX = wx;
+  renderer.contY = wy;
+});
+
+window.addEventListener("keydown", (e) => {
+  switch (e.key) {
+    case "+": case "=":  renderer.zoom(1.2); break;
+    case "-": case "_":  renderer.zoom(1 / 1.2); break;
+    case "s": case "S":  renderer.showSolarSystem = !renderer.showSolarSystem; break;
+    case "c": case "C":  renderer.contSource = !renderer.contSource; break;
+    case "1": renderer.setCenter(0); break;
+    case "2": renderer.setCenter(1); break;
+    case "3": renderer.setCenter(2); break;
+    case "4": renderer.setCenter(3); break;
+    case "F1": renderer.toggleResonance(0); e.preventDefault(); break;
+    case "F2": renderer.toggleResonance(1); e.preventDefault(); break;
+    case "F3": renderer.toggleResonance(2); e.preventDefault(); break;
+    case "F4": renderer.toggleResonance(3); e.preventDefault(); break;
+    case "[":  renderer.stepsPerFrame = Math.max(1, renderer.stepsPerFrame - 1); break;
+    case "]":  renderer.stepsPerFrame += 1; break;
+    case "r": case "R":
+      sys.initTracerRandom(CONFIG.NUM_TRACERS, CONFIG.DISK_RADIUS);
+      break;
+  }
+});
+
+// --- main loop ------------------------------------------------------
+function loop() {
+  for (let i = 0; i < renderer.stepsPerFrame; ++i) {
+    if (renderer.contSource) sys.setTracerTo(renderer.contX, renderer.contY);
+    sys.step();
+  }
+  renderer.render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

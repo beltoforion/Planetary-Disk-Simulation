@@ -110,6 +110,11 @@ void doReset(uint id, float seed, out vec2 pos, out vec2 vel, out vec2 stats) {
 }
 
 void main() {
+  // GLSL ES 3.00 requires gl_Position to be written even though
+  // rasterization is disabled during transform feedback. Some drivers
+  // tolerate omitting it, others silently no-op the whole shader.
+  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+
   vec2 pos = a_pos;
   vec2 vel = a_vel;
   vec2 stats = a_stats;
@@ -491,6 +496,15 @@ class GPUSimulation {
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
     gl.bindVertexArray(null);
 
+    // Surface any GL error on the very first step so we don't silently
+    // limp along producing garbage. Cleared once non-zero, then we stop
+    // checking to avoid stalling the pipeline every step.
+    if (this._checkError !== false) {
+      const err = gl.getError();
+      if (err) { this.lastGlError = err; this._checkError = false; }
+      else if (this.stepSeed > 4) this._checkError = false;
+    }
+
     this.read = writeIdx;
   }
 
@@ -700,6 +714,11 @@ class OverlayRenderer {
       for (let i = 0; i < s.nP; ++i)
         if (this.resonance & (1 << i)) txt += s.plName[i] + " ";
       ctx.fillText(txt, 12, 12 + 15 * lines.length);
+    }
+    if (sim && sim.lastGlError) {
+      ctx.fillStyle = "#f88";
+      ctx.fillText("GL error 0x" + sim.lastGlError.toString(16),
+                   12, this.h - 16);
     }
   }
 

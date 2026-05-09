@@ -55,62 +55,72 @@
 <script id="vs-integrate" type="x-shader/x-vertex">#version 300 es
 precision highp float;
 
-layout(location = 0) in vec2 a_pos;
-layout(location = 1) in vec2 a_oldPos;
+// Leapfrog (kick-drift) integrator: state is (pos, vel) instead of
+// (pos, oldPos) used by position-Verlet. Velocities are small (~1e-5
+// Mm/s) so float32 captures the per-step kick `a*dt` accurately even
+// near the outer disk, where the position-Verlet form was losing the
+// gravity term to catastrophic cancellation in `2*pos - oldPos`.
+
+layout(location = 0) in vec2 a_pos;     // scaled position (Mm)
+layout(location = 1) in vec2 a_vel;     // scaled velocity (Mm/s)
 layout(location = 2) in vec2 a_stats;   // (minDist, maxDist) in scaled units
 
-const int MAX_PLANETS = 8;
-uniform vec2  u_planetPos[MAX_PLANETS];   // scaled
-uniform float u_planetMass[MAX_PLANETS];  // kg
-uniform float u_planetRadX10[MAX_PLANETS]; // 10*radius, scaled
-uniform vec2  u_sunOldPos;                // sun pos previous step, scaled
+uniform vec2  u_planetPos[8];   // scaled
+uniform float u_planetMass[8];  // kg
+uniform float u_planetRadX10[8]; // 10*radius, scaled
 uniform int   u_numPlanets;
 
-uniform float u_K;       // -G*dt^2/L^3 (sign baked in for fewer ops)
-uniform float u_V0Sun;   // sqrt(G * M_sun / L^3) -> scaled orbital v scale
-uniform float u_dt;
-uniform vec2  u_bboxMin; // disk bounds (scaled, relative to sun)
-uniform vec2  u_bboxMax;
+uniform float u_Kv;      // -G*dt/L^3  (per-step velocity kick coefficient)
+uniform float u_dt;      // seconds
+uniform float u_V0Sun;   // sqrt(G * M_sun / L^3): scaled orbital-v factor
+uniform float u_Rmin;    // inner annulus radius, scaled
+uniform float u_Rmax;    // outer annulus radius, scaled
 uniform float u_seed;    // monotonically increasing per step
 
 out vec2 v_pos;
-out vec2 v_oldPos;
+out vec2 v_vel;
 out vec2 v_stats;
 
-// Cheap PCG-style hash for shader-side PRNG.
+// PCG hash. Uses only uint operations and uint shift counts.
 uint pcg(uint s) {
   s = s * 747796405u + 2891336453u;
-  uint w = ((s >> ((s >> 28) + 4u)) ^ s) * 277803737u;
-  return (w >> 22) ^ w;
+  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
 }
 float rand01(uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
 
-void doReset(uint id, float seed, out vec2 pos, out vec2 oldPos, out vec2 stats) {
+// Pick a position uniformly in the annulus [u_Rmin, u_Rmax] around the
+// Sun (uniform area density, so no clustering near small radii) and
+// give it the corresponding circular orbital velocity.
+void doReset(uint id, float seed, out vec2 pos, out vec2 vel, out vec2 stats) {
   uint h1 = id * 1973u + uint(seed * 977.0);
   uint h2 = h1 + 7919u;
-  vec2 newPos = u_bboxMin + vec2(rand01(h1), rand01(h2)) * (u_bboxMax - u_bboxMin)
-              + u_planetPos[0]; // bbox is relative to sun
-  vec2 r = newPos - u_planetPos[0];
-  float d = length(r);
-  float vmag = u_V0Sun / sqrt(d);            // |v| for circular orbit (scaled)
-  vec2 vel = vec2(r.y, -r.x) * (vmag / d);   // perpendicular to r
-  pos    = newPos;
-  oldPos = newPos - u_dt * vel;
-  stats  = vec2(1.0e9, 0.0);
+  float u1 = rand01(h1);
+  float u2 = rand01(h2);
+  float angle = 6.28318530718 * u1;
+  float r = sqrt(u_Rmin * u_Rmin + u2 * (u_Rmax * u_Rmax - u_Rmin * u_Rmin));
+  vec2 newPos = u_planetPos[0] + r * vec2(cos(angle), sin(angle));
+  vec2 rv = newPos - u_planetPos[0];
+  float d = length(rv);
+  float vmag = u_V0Sun / sqrt(d);
+  vec2 newVel = vec2(rv.y, -rv.x) * (vmag / d);
+  pos   = newPos;
+  vel   = newVel;
+  stats = vec2(1.0e9, 0.0);
 }
 
 void main() {
   vec2 pos = a_pos;
-  vec2 oldPos = a_oldPos;
+  vec2 vel = a_vel;
   vec2 stats = a_stats;
   uint id = uint(gl_VertexID);
 
-  // ---- accumulate gravitational acceleration from all planets ------
+  // Σ m_j * (r - rp_j) / |r - rp_j|^3   (sign baked into u_Kv).
   vec2 acc = vec2(0.0);
   float dist0 = 0.0;
   bool collided = false;
 
-  for (int j = 0; j < MAX_PLANETS; ++j) {
+  for (int j = 0; j < 8; ++j) {
     if (j >= u_numPlanets) break;
     vec2 r = pos - u_planetPos[j];
     float d2 = dot(r, r) + 1e-12;
@@ -122,37 +132,37 @@ void main() {
   }
 
   if (collided) {
-    doReset(id, u_seed, v_pos, v_oldPos, v_stats);
+    doReset(id, u_seed, v_pos, v_vel, v_stats);
     return;
   }
 
-  // ---- Verlet step ------------------------------------------------
-  // r_new = 2*r - r_old + a*dt^2  (in scaled units, with K = -G*dt^2/L^3)
-  vec2 newPos = 2.0 * pos - oldPos + u_K * acc;
+  // Leapfrog kick + drift.
+  vec2 newVel = vel + u_Kv * acc;
+  vec2 newPos = pos + newVel * u_dt;
 
-  // ---- track perihelion/aphelion (relative to sun) ----------------
+  // Perihelion/aphelion bookkeeping (relative to Sun).
   stats.x = min(stats.x, dist0);
   stats.y = max(stats.y, dist0);
 
-  // ---- once-per-orbit eccentricity gate ---------------------------
+  // Once-per-orbit eccentricity gate: tracer just crossed +x axis above
+  // the Sun. If perihelion/aphelion ratio is too low, reset it.
   vec2 sunPos = u_planetPos[0];
-  if (newPos.x > sunPos.x && pos.x < u_sunOldPos.x && newPos.y > sunPos.y) {
+  if (newPos.x > sunPos.x && pos.x < sunPos.x && newPos.y > sunPos.y) {
     float exc = stats.x / max(stats.y, 1e-12);
-    if (exc < 0.75) { doReset(id, u_seed + 0.5, v_pos, v_oldPos, v_stats); return; }
+    if (exc < 0.75) { doReset(id, u_seed + 0.5, v_pos, v_vel, v_stats); return; }
     stats = vec2(1.0e9, 0.0);
   }
 
-  // ---- bbox cull (relative to sun) --------------------------------
-  vec2 rel = newPos - sunPos;
-  if (rel.x < u_bboxMin.x || rel.x > u_bboxMax.x ||
-      rel.y < u_bboxMin.y || rel.y > u_bboxMax.y) {
-    doReset(id, u_seed + 0.25, v_pos, v_oldPos, v_stats);
+  // Cull tracers that escaped (or fell into the keep-out radius).
+  float relDist = length(newPos - sunPos);
+  if (relDist > u_Rmax || relDist < u_Rmin * 0.5) {
+    doReset(id, u_seed + 0.25, v_pos, v_vel, v_stats);
     return;
   }
 
-  v_pos    = newPos;
-  v_oldPos = pos;
-  v_stats  = stats;
+  v_pos   = newPos;
+  v_vel   = newVel;
+  v_stats = stats;
 }
 </script>
 
@@ -191,7 +201,7 @@ void main() { outColor = vec4(1.0, 1.0, 1.0, 1.0); }
 // ===================================================================
 const CONFIG = {
   DELTA_T: 20000,
-  NUM_TRACERS: 200000,        // bumped 6.6x now that the GPU is doing the work
+  NUM_TRACERS: 100000,
   DISK_RADIUS: 1e9,
   PLANETS: [
     { name: "Sun",     rad: 695700, mass: 1.989e30, orbit: null,
@@ -330,7 +340,7 @@ class GPUSimulation {
     const fsInt = compileShader(gl, gl.FRAGMENT_SHADER, shaderSrc("fs-integrate"));
     const vsRen = compileShader(gl, gl.VERTEX_SHADER,   shaderSrc("vs-render"));
     const fsRen = compileShader(gl, gl.FRAGMENT_SHADER, shaderSrc("fs-render"));
-    this.intProg = linkProgram(gl, vsInt, fsInt, ["v_pos", "v_oldPos", "v_stats"]);
+    this.intProg = linkProgram(gl, vsInt, fsInt, ["v_pos", "v_vel", "v_stats"]);
     this.renProg = linkProgram(gl, vsRen, fsRen, null);
 
     // Cache uniform locations.
@@ -338,13 +348,12 @@ class GPUSimulation {
       planetPos:    gl.getUniformLocation(this.intProg, "u_planetPos[0]"),
       planetMass:   gl.getUniformLocation(this.intProg, "u_planetMass[0]"),
       planetRadX10: gl.getUniformLocation(this.intProg, "u_planetRadX10[0]"),
-      sunOldPos:    gl.getUniformLocation(this.intProg, "u_sunOldPos"),
       numPlanets:   gl.getUniformLocation(this.intProg, "u_numPlanets"),
-      K:            gl.getUniformLocation(this.intProg, "u_K"),
+      Kv:           gl.getUniformLocation(this.intProg, "u_Kv"),
       V0Sun:        gl.getUniformLocation(this.intProg, "u_V0Sun"),
       dt:           gl.getUniformLocation(this.intProg, "u_dt"),
-      bboxMin:      gl.getUniformLocation(this.intProg, "u_bboxMin"),
-      bboxMax:      gl.getUniformLocation(this.intProg, "u_bboxMax"),
+      Rmin:         gl.getUniformLocation(this.intProg, "u_Rmin"),
+      Rmax:         gl.getUniformLocation(this.intProg, "u_Rmax"),
       seed:         gl.getUniformLocation(this.intProg, "u_seed"),
     };
     this.renU = {
@@ -352,46 +361,48 @@ class GPUSimulation {
       invFov:    gl.getUniformLocation(this.renProg, "u_invFov"),
     };
 
+    // Annulus bounds (scaled).
+    this.Rmin = (this.sys.plRad[0] * 20) / L;        // sun keep-out
+    this.Rmax = CONFIG.DISK_RADIUS / L;
+
     // Initial tracer state (CPU-side, then uploaded once).
     const initPos   = new Float32Array(n * 2);
-    const initOld   = new Float32Array(n * 2);
+    const initVel   = new Float32Array(n * 2);
     const initStats = new Float32Array(n * 2);
-    this._initTracerData(initPos, initOld, initStats);
-
-    // Disk bbox in scaled units (relative to sun, since the cull check
-    // is `pos - sun in [bboxMin, bboxMax]`).
-    const radS = CONFIG.DISK_RADIUS / L;
-    this.bboxMin = [-radS, -radS];
-    this.bboxMax = [ radS,  radS];
+    this._initTracerData(initPos, initVel, initStats);
 
     // Build two ping-pong states.
     this.states = [
-      this._createState(initPos, initOld, initStats),
-      this._createState(initPos, initOld, initStats),
+      this._createState(initPos, initVel, initStats),
+      this._createState(initPos, initVel, initStats),
     ];
   }
 
-  _initTracerData(pos, old, stats) {
-    const sunSpc = this.sys.plRad[0] * 20;
-    const radKm = CONFIG.DISK_RADIUS - sunSpc;
+  // Uniform area density in the annulus [Rmin, Rmax]: pick r from
+  // sqrt(Rmin^2 + u*(Rmax^2 - Rmin^2)). The CPU-side initial state and
+  // the GPU-side reset both use this distribution so the disk stays
+  // statistically uniform across resets.
+  _initTracerData(pos, vel, stats) {
     const sunXkm = this.sys.plX[0], sunYkm = this.sys.plY[0];
-    const dt = this.sys.dt;
+    const RminKm = this.Rmin * L, RmaxKm = this.Rmax * L;
+    const Rmin2 = RminKm * RminKm, Rmax2 = RmaxKm * RmaxKm;
     for (let i = 0; i < this.n; ++i) {
-      const dKm = sunSpc + radKm * Math.random();
+      const u = Math.random();
+      const dKm = Math.sqrt(Rmin2 + u * (Rmax2 - Rmin2));
       const elon = 2 * Math.PI * Math.random();
       const xKm = sunXkm + dKm * Math.cos(elon);
       const yKm = sunYkm + dKm * Math.sin(elon);
       const v   = this.sys._orbitalVel(0, xKm, yKm); // km/s
       pos[2*i]     = xKm / L;
       pos[2*i + 1] = yKm / L;
-      old[2*i]     = (xKm - dt * v.vx) / L;
-      old[2*i + 1] = (yKm - dt * v.vy) / L;
+      vel[2*i]     = v.vx / L;       // km/s -> Mm/s
+      vel[2*i + 1] = v.vy / L;
       stats[2*i]     = 1e9;
       stats[2*i + 1] = 0;
     }
   }
 
-  _createState(initPos, initOld, initStats) {
+  _createState(initPos, initVel, initStats) {
     const gl = this.gl;
     const mkBuf = (data) => {
       const b = gl.createBuffer();
@@ -400,16 +411,15 @@ class GPUSimulation {
       return b;
     };
     const posBuf   = mkBuf(initPos);
-    const oldBuf   = mkBuf(initOld);
+    const velBuf   = mkBuf(initVel);
     const statsBuf = mkBuf(initStats);
 
-    // VAO used as input to the integration shader (3 attributes).
     const intVAO = gl.createVertexArray();
     gl.bindVertexArray(intVAO);
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, oldBuf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, velBuf);
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, statsBuf);
@@ -417,7 +427,6 @@ class GPUSimulation {
     gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
-    // VAO used for rendering (just the position).
     const renVAO = gl.createVertexArray();
     gl.bindVertexArray(renVAO);
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
@@ -425,15 +434,14 @@ class GPUSimulation {
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
-    // Transform feedback object that captures into these 3 buffers.
     const tf = gl.createTransformFeedback();
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, posBuf);
-    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, oldBuf);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, velBuf);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 2, statsBuf);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
 
-    return { posBuf, oldBuf, statsBuf, intVAO, renVAO, tf };
+    return { posBuf, velBuf, statsBuf, intVAO, renVAO, tf };
   }
 
   step() {
@@ -460,18 +468,17 @@ class GPUSimulation {
     gl.uniform2fv(this.intU.planetPos,    planetPos);
     gl.uniform1fv(this.intU.planetMass,   planetMass);
     gl.uniform1fv(this.intU.planetRadX10, planetRadX10);
-    gl.uniform2f(this.intU.sunOldPos, sys.plOX[0] / L, sys.plOY[0] / L);
     gl.uniform1i(this.intU.numPlanets, sys.nP);
 
-    // K = -G * dt^2 / L^3  (the minus folds in the sign of acceleration).
-    const K = -GAMMA * sys.dt * sys.dt / (L * L * L);
-    gl.uniform1f(this.intU.K, K);
+    // Kv = -G * dt / L^3  (per-step velocity kick coefficient; sign baked in).
+    const Kv = -GAMMA * sys.dt / (L * L * L);
+    gl.uniform1f(this.intU.Kv, Kv);
     // V0 such that v_scaled = V0 / sqrt(d_scaled) gives circular orbital v.
     const V0 = Math.sqrt(GAMMA * sys.plMass[0] / (L * L * L));
     gl.uniform1f(this.intU.V0Sun, V0);
     gl.uniform1f(this.intU.dt, sys.dt);
-    gl.uniform2f(this.intU.bboxMin, this.bboxMin[0], this.bboxMin[1]);
-    gl.uniform2f(this.intU.bboxMax, this.bboxMax[0], this.bboxMax[1]);
+    gl.uniform1f(this.intU.Rmin, this.Rmin);
+    gl.uniform1f(this.intU.Rmax, this.Rmax);
     gl.uniform1f(this.intU.seed, this.stepSeed);
 
     gl.bindVertexArray(this.states[this.read].intVAO);
@@ -506,28 +513,26 @@ class GPUSimulation {
   }
 
   // Inject a tracer at world (km) coords with circular-orbit velocity
-  // around `centerIdx`. Writes a single slot in the current "read"
-  // buffers (which the next integration step will consume).
+  // around `centerIdx`. Writes one slot in the current "read" buffers
+  // (which the next integration step will consume).
   injectTracer(xKm, yKm, centerIdx) {
     if (this._injIdx === undefined) this._injIdx = 0;
     this._injIdx = (this._injIdx + 1) % this.n;
     const i = this._injIdx;
 
     const v = this.sys._orbitalVel(centerIdx, xKm, yKm);
-    const dt = this.sys.dt;
     const xs = xKm / L, ys = yKm / L;
-    const oxs = (xKm - dt * v.vx) / L, oys = (yKm - dt * v.vy) / L;
+    const vxs = v.vx / L, vys = v.vy / L;
 
     const gl = this.gl;
     const st = this.states[this.read];
     const tmp = new Float32Array([xs, ys]);
     gl.bindBuffer(gl.ARRAY_BUFFER, st.posBuf);
     gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp);
-    tmp[0] = oxs; tmp[1] = oys;
-    gl.bindBuffer(gl.ARRAY_BUFFER, st.oldBuf);
+    tmp[0] = vxs; tmp[1] = vys;
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.velBuf);
     gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp);
-    // Reset stats for that slot so the eccentricity gate doesn't
-    // immediately fire on stale data.
+    // Reset stats so the eccentricity gate doesn't fire on stale data.
     const tmp2 = new Float32Array([1e9, 0]);
     gl.bindBuffer(gl.ARRAY_BUFFER, st.statsBuf);
     gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp2);
@@ -537,15 +542,15 @@ class GPUSimulation {
   // Re-randomise the disk by re-uploading initial data to both states.
   resetDisk() {
     const initPos   = new Float32Array(this.n * 2);
-    const initOld   = new Float32Array(this.n * 2);
+    const initVel   = new Float32Array(this.n * 2);
     const initStats = new Float32Array(this.n * 2);
-    this._initTracerData(initPos, initOld, initStats);
+    this._initTracerData(initPos, initVel, initStats);
     const gl = this.gl;
     for (const st of this.states) {
       gl.bindBuffer(gl.ARRAY_BUFFER, st.posBuf);
       gl.bufferData(gl.ARRAY_BUFFER, initPos, gl.DYNAMIC_COPY);
-      gl.bindBuffer(gl.ARRAY_BUFFER, st.oldBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, initOld, gl.DYNAMIC_COPY);
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.velBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, initVel, gl.DYNAMIC_COPY);
       gl.bindBuffer(gl.ARRAY_BUFFER, st.statsBuf);
       gl.bufferData(gl.ARRAY_BUFFER, initStats, gl.DYNAMIC_COPY);
     }

@@ -517,16 +517,14 @@ class GPUSimulation {
     this.read = writeIdx;
   }
 
-  render(centerIdx, fovKm, rotCos, rotSin) {
+  render(centerWorldX, centerWorldY, fovKm, rotCos, rotSin) {
     const gl = this.gl;
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.useProgram(this.renProg);
-    const cx = this.sys.plX[centerIdx] / L;
-    const cy = this.sys.plY[centerIdx] / L;
-    gl.uniform2f(this.renU.centerPos, cx, cy);
+    gl.uniform2f(this.renU.centerPos, centerWorldX / L, centerWorldY / L);
     const fovScaled = fovKm / L;
     gl.uniform2f(this.renU.invFov, 2 / fovScaled, 2 / fovScaled);
     gl.uniform2f(this.renU.rot, rotCos, rotSin);
@@ -631,10 +629,25 @@ class OverlayRenderer {
     return { c: dx / d, s: -dy / d };
   }
 
+  // World position the camera is anchored to. In co-rotation mode,
+  // anchor at the midpoint of the Sun and the co-rotation target so
+  // both lie symmetrically on the screen — handy for L4/L5 Trojans.
+  getEffectiveCenter() {
+    if (this.coRotateIdx > 0) {
+      const s = this.sys;
+      return {
+        x: 0.5 * (s.plX[0] + s.plX[this.coRotateIdx]),
+        y: 0.5 * (s.plY[0] + s.plY[this.coRotateIdx]),
+      };
+    }
+    return { x: this.sys.plX[this.center], y: this.sys.plY[this.center] };
+  }
+
   worldToScreen(x, y) {
-    const s = this.sys, sc = this.scale;
-    const dx = x - s.plX[this.center];
-    const dy = y - s.plY[this.center];
+    const sc = this.scale;
+    const c = this.getEffectiveCenter();
+    const dx = x - c.x;
+    const dy = y - c.y;
     const r = this.getRotation();
     const rx = dx * r.c - dy * r.s;
     const ry = dx * r.s + dy * r.c;
@@ -800,8 +813,9 @@ cvCanvas.addEventListener("mousedown", (e) => {
   const r = overlay.getRotation();
   const dx =  sx * r.c + sy * r.s;
   const dy = -sx * r.s + sy * r.c;
-  const wx = dx + sys.plX[overlay.center];
-  const wy = dy + sys.plY[overlay.center];
+  const c = overlay.getEffectiveCenter();
+  const wx = dx + c.x;
+  const wy = dy + c.y;
   sim.injectTracer(wx, wy, overlay.center);
   overlay.contX = wx; overlay.contY = wy;
 });
@@ -842,7 +856,8 @@ function loop() {
     stepsT0 = now;
   }
   const rot = overlay.getRotation();
-  sim.render(overlay.center, overlay.fov, rot.c, rot.s);
+  const c = overlay.getEffectiveCenter();
+  sim.render(c.x, c.y, overlay.fov, rot.c, rot.s);
   overlay.render(stepsLastSec);
   overlay.bumpFrame();
   requestAnimationFrame(loop);

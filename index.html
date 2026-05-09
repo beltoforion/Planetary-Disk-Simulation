@@ -387,17 +387,18 @@ class GPUSimulation {
     this.Rmin = (this.sys.plRad[0] * 20) / L;        // sun keep-out
     this.Rmax = CONFIG.DISK_RADIUS / L;
 
-    // Initial tracer state (CPU-side, then uploaded once).
-    const initPos   = new Float32Array(n * 2);
-    const initVel   = new Float32Array(n * 2);
-    const initStats = new Float32Array(n * 2);
-    this._initTracerData(initPos, initVel, initStats);
-
-    // Build two ping-pong states.
+    // Allocate ping-pong state buffers (sized but contents replaced
+    // immediately below).
+    const empty = new Float32Array(n * 2);
     this.states = [
-      this._createState(initPos, initVel, initStats),
-      this._createState(initPos, initVel, initStats),
+      this._createState(empty, empty, empty),
+      this._createState(empty, empty, empty),
     ];
+    // Identical to what 'R' does: re-upload fresh initial data into
+    // every buffer after TF bindings exist. Doing it this way at boot
+    // sidesteps a driver issue where TF dispatches were no-ops until
+    // a bufferData on a TF-bound buffer "primed" things.
+    this.resetDisk();
   }
 
   // Uniform area density in the annulus [Rmin, Rmax]: pick r from
@@ -813,13 +814,6 @@ if (!gl) {
 const sys = new PlanetarySystem(CONFIG);
 const sim = new GPUSimulation(gl, sys, CONFIG.NUM_TRACERS);
 const overlay = new OverlayRenderer(cvCanvas, sys);
-
-// Synchronously warm up the GPU pipeline before the rAF loop hands
-// control back to the browser. Drives the integration shader once and
-// forces a sync so the driver actually executes the work instead of
-// queueing it indefinitely.
-sim.step();
-gl.finish();
 
 // --- input ---------------------------------------------------------
 cvCanvas.addEventListener("mousedown", (e) => {

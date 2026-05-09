@@ -196,14 +196,22 @@ void main() {
   vec2 ndc = rotated * u_invFov;
   // Flip Y to match the Canvas2D convention (y grows downward).
   gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-  gl_PointSize = 1.0;
+  gl_PointSize = 3.0;
 }
 </script>
 
 <script id="fs-render" type="x-shader/x-fragment">#version 300 es
 precision highp float;
 out vec4 outColor;
-void main() { outColor = vec4(1.0, 1.0, 1.0, 1.0); }
+// Soft round blob: 1.0 at the center, fading to 0 at the point edge.
+// Combined with additive blending this gives dense regions a glow.
+void main() {
+  vec2 c = gl_PointCoord - 0.5;
+  float r2 = dot(c, c);
+  if (r2 > 0.25) discard;
+  float a = 1.0 - smoothstep(0.0, 0.25, r2);
+  outColor = vec4(a, a, a, a);
+}
 </script>
 
 <script>
@@ -529,9 +537,14 @@ class GPUSimulation {
     gl.uniform2f(this.renU.invFov, 2 / fovScaled, 2 / fovScaled);
     gl.uniform2f(this.renU.rot, rotCos, rotSin);
 
+    // Additive blending: stacked tracers brighten the pixel without
+    // clipping, so dense Trojan/resonance clumps glow naturally.
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.bindVertexArray(this.states[this.read].renVAO);
     gl.drawArrays(gl.POINTS, 0, this.n);
     gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
   }
 
   // Inject a tracer at world (km) coords with circular-orbit velocity

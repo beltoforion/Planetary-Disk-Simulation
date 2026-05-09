@@ -43,6 +43,13 @@
     <kbd>T</kbd> co-rotate frame (cycles Earth/Jupiter/off) &middot;
     <kbd>[</kbd>/<kbd>]</kbd> steps/frame &middot;
     <kbd>R</kbd> reset disk
+    <br>
+    <label style="display:inline-flex; align-items:center; gap:8px; margin-top:4px;">
+      <span>Eccentricity gate (kill if peri/apo &lt;):</span>
+      <input id="eccSlider" type="range" min="0" max="0.95" step="0.01" value="0.75" style="width:200px;">
+      <span id="eccVal" style="min-width:6em;">0.75 (e&approx;0.14)</span>
+    </label>
+    <span style="color:#888;"> &mdash; lower = let eccentric tracers live (Hildas survive); 0 = off.</span>
   </div>
 </div>
 
@@ -77,6 +84,7 @@ uniform float u_V0Sun;   // sqrt(G * M_sun / L^3): scaled orbital-v factor
 uniform float u_Rmin;    // inner annulus radius, scaled
 uniform float u_Rmax;    // outer annulus radius, scaled
 uniform float u_seed;    // monotonically increasing per step
+uniform float u_eccGate; // perihelion/aphelion ratio below which a tracer is killed
 
 out vec2 v_pos;
 out vec2 v_vel;
@@ -155,7 +163,7 @@ void main() {
   vec2 sunPos = u_planetPos[0];
   if (newPos.x > sunPos.x && pos.x < sunPos.x && newPos.y > sunPos.y) {
     float exc = stats.x / max(stats.y, 1e-12);
-    if (exc < 0.75) { doReset(id, u_seed + 0.5, v_pos, v_vel, v_stats); return; }
+    if (exc < u_eccGate) { doReset(id, u_seed + 0.5, v_pos, v_vel, v_stats); return; }
     stats = vec2(1.0e9, 0.0);
   }
 
@@ -355,6 +363,7 @@ class GPUSimulation {
     this.n = n;
     this.read = 0;
     this.stepSeed = 0;
+    this.eccGate  = 0.75;   // perihelion/aphelion cutoff for the kill gate
 
     // Compile programs.
     const vsInt = compileShader(gl, gl.VERTEX_SHADER,   shaderSrc("vs-integrate"));
@@ -376,6 +385,7 @@ class GPUSimulation {
       Rmin:         gl.getUniformLocation(this.intProg, "u_Rmin"),
       Rmax:         gl.getUniformLocation(this.intProg, "u_Rmax"),
       seed:         gl.getUniformLocation(this.intProg, "u_seed"),
+      eccGate:      gl.getUniformLocation(this.intProg, "u_eccGate"),
     };
     this.renU = {
       centerPos: gl.getUniformLocation(this.renProg, "u_centerPos"),
@@ -503,6 +513,7 @@ class GPUSimulation {
     gl.uniform1f(this.intU.Rmin, this.Rmin);
     gl.uniform1f(this.intU.Rmax, this.Rmax);
     gl.uniform1f(this.intU.seed, this.stepSeed);
+    gl.uniform1f(this.intU.eccGate, this.eccGate);
 
     gl.bindVertexArray(this.states[this.read].intVAO);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, this.states[writeIdx].tf);
@@ -832,6 +843,24 @@ cvCanvas.addEventListener("mousedown", (e) => {
   const wy = dy + c.y;
   sim.injectTracer(wx, wy, overlay.center);
   overlay.contX = wx; overlay.contY = wy;
+});
+
+// Eccentricity-gate slider: applies on the next step (no reset needed).
+const eccSlider = document.getElementById("eccSlider");
+const eccVal = document.getElementById("eccVal");
+function updateEccLabel() {
+  const x = sim.eccGate;
+  // exc = (1-e)/(1+e)  =>  e = (1-exc)/(1+exc).
+  const e = (1 - x) / (1 + x);
+  eccVal.textContent = (x === 0)
+    ? "0.00 (off)"
+    : x.toFixed(2) + " (e≈" + e.toFixed(2) + ")";
+}
+eccSlider.value = sim.eccGate;
+updateEccLabel();
+eccSlider.addEventListener("input", () => {
+  sim.eccGate = parseFloat(eccSlider.value);
+  updateEccLabel();
 });
 
 window.addEventListener("keydown", (e) => {

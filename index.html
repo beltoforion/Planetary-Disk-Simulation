@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Planetary Disk Simulation (GPU)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #fff;
+               font-family: Consolas, "Courier New", monospace; height: 100%; }
+  #wrap { display: flex; flex-direction: column; align-items: center; }
+  #stage { position: relative; width: 800px; height: 800px; }
+  #stage canvas { position: absolute; left: 0; top: 0; width: 800px; height: 800px;
+                  image-rendering: pixelated; }
+  #stage #cv { background: transparent; cursor: crosshair; }
+  #help { max-width: 800px; padding: 8px 12px; font-size: 12px;
+          color: #bbb; line-height: 1.4; }
+  #help b { color: #fff; }
+  #help kbd { background: #222; border: 1px solid #444; padding: 0 4px;
+              border-radius: 3px; color: #fff; }
+  #fallback { color: #f88; padding: 12px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="gl" width="800" height="800"></canvas>
+    <canvas id="cv" width="800" height="800"></canvas>
+  </div>
+  <div id="fallback" style="display:none">
+    WebGL2 is required but not available in this browser.
+  </div>
+  <div id="help">
+    <b>Planetary Disk Simulation (GPU)</b> &mdash; 2D Verlet integration of a
+    dust disk perturbed by Jupiter. Tracer integration runs on the GPU via
+    WebGL2 transform feedback; planets are stepped on the CPU.
+    <br>
+    <b>Controls:</b>
+    click to inject a tracer &middot;
+    <kbd>+</kbd>/<kbd>-</kbd> zoom &middot;
+    <kbd>1</kbd>..<kbd>4</kbd> center on planet &middot;
+    <kbd>S</kbd> solar-system overlay &middot;
+    <kbd>C</kbd> continuous source &middot;
+    <kbd>F1</kbd>..<kbd>F4</kbd> resonance markers &middot;
+    <kbd>T</kbd> co-rotate frame (cycles Earth/Jupiter/off) &middot;
+    <kbd>[</kbd>/<kbd>]</kbd> steps/frame &middot;
+    <kbd>R</kbd> reset disk
+    <br>
+    <label style="display:inline-flex; align-items:center; gap:8px; margin-top:4px;">
+      <span>Eccentricity gate (kill if peri/apo &lt;):</span>
+      <input id="eccSlider" type="range" min="0" max="0.95" step="0.01" value="0.75" style="width:200px;">
+      <span id="eccVal" style="min-width:6em;">0.75 (e&approx;0.14)</span>
+    </label>
+    <span style="color:#888;"> &mdash; lower = let eccentric tracers live (Hildas survive); 0 = off.</span>
+    <br>
+    <label style="display:inline-flex; align-items:center; gap:8px; margin-top:4px;">
+      <span>Poynting-Robertson drag (small grains die first):</span>
+      <input id="prSlider" type="range" min="0" max="2000" step="1" value="0" style="width:200px;">
+      <span id="prVal" style="min-width:5em;">off</span>
+    </label>
+    <span style="color:#888;"> &mdash; tracer colour cyan&rarr;yellow encodes grain size (small&rarr;large).</span>
+  </div>
+</div>
+
+<!-- ===================================================================
+     Shaders
+     =================================================================== -->
+
+<!-- Tracer integration: one Verlet step + reset/eccentricity logic.
+     Captured via transform feedback into the "write" buffers. Rasterizer
+     is disabled while this runs, so the fragment shader is unused. -->
+<script id="vs-integrate" type="x-shader/x-vertex">#version 300 es
+precision highp float;
+
+// Leapfrog (kick-drift) integrator: state is (pos, vel) instead of
+// (pos, oldPos) used by position-Verlet. Velocities are small (~1e-5
+// Mm/s) so float32 captures the per-step kick `a*dt` accurately even
+// near the outer disk, where the position-Verlet form was losing the
+// gravity term to catastrophic cancellation in `2*pos - oldPos`.
+
+layout(location = 0) in vec2 a_pos;     // scaled position (Mm)
+layout(location = 1) in vec2 a_vel;     // scaled velocity (Mm/s)
+layout(location = 2) in vec2 a_stats;   // (minDist, maxDist) in scaled units
+layout(location = 3) in float a_size;   // grain size, normalized to [0,1] (small -> large)
+
+uniform vec2  u_planetPos[8];   // scaled
+uniform float u_planetMass[8];  // kg
+uniform float u_planetRadX10[8]; // 10*radius, scaled
+uniform int   u_numPlanets;
+
+uniform float u_Kv;      // -G*dt/L^3  (per-step velocity kick coefficient)
+uniform float u_dt;      // seconds
+uniform float u_V0Sun;   // sqrt(G * M_sun / L^3): scaled orbital-v factor
+uniform float u_Rmin;    // inner annulus radius, scaled
+uniform float u_Rmax;    // outer annulus radius, scaled
+uniform float u_seed;    // monotonically increasing per step
+uniform float u_eccGate; // perihelion/aphelion ratio below which a tracer is killed
+uniform float u_prCoef;  // PR-drag coefficient: -G*M_sun*dt / (c*L^2). 0 disables drag.
+
+out vec2 v_pos;
+out vec2 v_vel;
+out vec2 v_stats;
+out float v_size;
+
+// PCG hash. Uses only uint operations and uint shift counts.
+uint pcg(uint s) {
+  s = s * 747796405u + 2891336453u;
+  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+float rand01(uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
+
+// Pick a position uniformly in the annulus [u_Rmin, u_Rmax] around the
+// Sun (uniform area density, so no clustering near small radii) and
+// give it the corresponding circular orbital velocity.
+void doReset(uint id, float seed,
+             out vec2 pos, out vec2 vel, out vec2 stats, out float size) {
+  uint h1 = id * 1973u + uint(seed * 977.0);
+  uint h2 = h1 + 7919u;
+  uint h3 = h1 * 2654435761u + 13u;
+  float u1 = rand01(h1);
+  float u2 = rand01(h2);
+  float angle = 6.28318530718 * u1;
+  float r = sqrt(u_Rmin * u_Rmin + u2 * (u_Rmax * u_Rmax - u_Rmin * u_Rmin));
+  vec2 newPos = u_planetPos[0] + r * vec2(cos(angle), sin(angle));
+  vec2 rv = newPos - u_planetPos[0];
+  float d = length(rv);
+  float vmag = u_V0Sun / sqrt(d);
+  vec2 newVel = vec2(rv.y, -rv.x) * (vmag / d);
+  pos   = newPos;
+  vel   = newVel;
+  stats = vec2(1.0e9, 0.0);
+  size  = rand01(h3);    // fresh random size on respawn
+}
+
+void main() {
+  // GLSL ES 3.00 requires gl_Position to be written even though
+  // rasterization is disabled during transform feedback. Some drivers
+  // tolerate omitting it, others silently no-op the whole shader.
+  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+
+  vec2 pos = a_pos;
+  vec2 vel = a_vel;
+  vec2 stats = a_stats;
+  float size = a_size;
+  uint id = uint(gl_VertexID);
+
+  // Σ m_j * (r - rp_j) / |r - rp_j|^3   (sign baked into u_Kv).
+  vec2 acc = vec2(0.0);
+  float dist0 = 0.0;
+  bool collided = false;
+
+  for (int j = 0; j < 8; ++j) {
+    if (j >= u_numPlanets) break;
+    vec2 r = pos - u_planetPos[j];
+    float d2 = dot(r, r) + 1e-12;
+    float d = sqrt(d2);
+    float g = u_planetMass[j] / (d2 * d);
+    if (j == 0) dist0 = d;
+    acc += g * r;
+    if (d < u_planetRadX10[j]) collided = true;
+  }
+
+  if (collided) {
+    doReset(id, u_seed, v_pos, v_vel, v_stats, v_size);
+    return;
+  }
+
+  // Leapfrog kick + drift.
+  vec2 newVel = vel + u_Kv * acc;
+
+  // Poynting-Robertson drag: small particles spiral in, large ones don't.
+  // beta = u_prCoef-implied strength scaled by 1/size (clamped). The
+  // delta-v per step is approximately -beta * GM_sun*dt / (c*r^2) * v.
+  // u_prCoef already absorbs the GM_sun*dt/(c*L^2) constants.
+  if (u_prCoef > 0.0) {
+    float invR2 = 1.0 / (dist0 * dist0 + 1e-12);
+    float beta  = u_prCoef / max(size, 0.02);   // 0.02 floor avoids divide blow-up
+    newVel -= beta * invR2 * vel;
+  }
+
+  vec2 newPos = pos + newVel * u_dt;
+
+  // Perihelion/aphelion bookkeeping (relative to Sun).
+  stats.x = min(stats.x, dist0);
+  stats.y = max(stats.y, dist0);
+
+  // Once-per-orbit eccentricity gate: tracer just crossed +x axis above
+  // the Sun. If perihelion/aphelion ratio is too low, reset it.
+  vec2 sunPos = u_planetPos[0];
+  if (newPos.x > sunPos.x && pos.x < sunPos.x && newPos.y > sunPos.y) {
+    float exc = stats.x / max(stats.y, 1e-12);
+    if (exc < u_eccGate) { doReset(id, u_seed + 0.5, v_pos, v_vel, v_stats, v_size); return; }
+    stats = vec2(1.0e9, 0.0);
+  }
+
+  // Cull tracers that escaped (or fell into the keep-out radius).
+  float relDist = length(newPos - sunPos);
+  if (relDist > u_Rmax || relDist < u_Rmin * 0.5) {
+    doReset(id, u_seed + 0.25, v_pos, v_vel, v_stats, v_size);
+    return;
+  }
+
+  v_pos   = newPos;
+  v_size  = size;
+  v_vel   = newVel;
+  v_stats = stats;
+}
+</script>
+
+<script id="fs-integrate" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+out vec4 outColor;
+void main() { outColor = vec4(0.0); }   // unused: rasterizer is disabled
+</script>
+
+<!-- Tracer rendering: one POINTS draw call, projects scaled world coords
+     into clip space using the centered body and current FOV. -->
+<script id="vs-render" type="x-shader/x-vertex">#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_pos;       // scaled position (inertial)
+layout(location = 1) in float a_size;     // grain size in [0,1]
+uniform vec2 u_centerPos;                 // scaled
+uniform vec2 u_invFov;                    // 2 / (fov_scaled) per axis
+uniform vec2 u_rot;                       // (cos a, sin a); (1, 0) when off
+out float v_size;
+void main() {
+  vec2 d = a_pos - u_centerPos;
+  vec2 rotated = vec2(d.x * u_rot.x - d.y * u_rot.y,
+                      d.x * u_rot.y + d.y * u_rot.x);
+  vec2 ndc = rotated * u_invFov;
+  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+  // Larger grains render slightly bigger so the visual cue stacks with
+  // the colour cue.
+  gl_PointSize = mix(6.0, 12.0, a_size);
+  v_size = clamp(a_size, 0.0, 1.0);
+}
+</script>
+
+<script id="fs-render" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+in float v_size;
+out vec4 outColor;
+// Cool blue (small grains) -> warm yellow (large grains). Combined with
+// additive blending the surviving population's colour shifts visibly as
+// PR drag eats the small grains.
+void main() {
+  vec2 c = gl_PointCoord - 0.5;
+  float r2 = dot(c, c);
+  float a = 0.18 * exp(-r2 * 11.0);
+  vec3 col = mix(vec3(0.45, 0.65, 1.0), vec3(1.0, 0.85, 0.45), v_size);
+  outColor = vec4(col * a, a);
+}
+</script>
+
+<script>
+"use strict";
+
+// ===================================================================
+// Configuration (mirrors solar_system.cfg)
+// ===================================================================
+const CONFIG = {
+  DELTA_T: 20000,
+  NUM_TRACERS: 100000,
+  DISK_RADIUS: 1e9,
+  PLANETS: [
+    { name: "Sun",     rad: 695700, mass: 1.989e30, orbit: null,
+      color: [1.00, 1.00, 1.00, 1.0], css: "rgba(255,255,255,1)" },
+    { name: "Earth",   rad: 6378,   mass: 5.974e24,
+      orbit: { around: "Sun", elonDeg: -90, dist: 149600000 },
+      color: [0.00, 0.48, 0.38, 1.0], css: "rgba(0,123,98,1)" },
+    { name: "Jupiter", rad: 71492,  mass: 1.899e27,
+      orbit: { around: "Sun", elonDeg: 0,   dist: 778570000 },
+      color: [1.00, 0.38, 0.14, 1.0], css: "rgba(255,97,35,1)" },
+  ],
+};
+
+const GAMMA   = 6.67428e-20;     // km^3 / (kg s^2)
+const L       = 1e6;             // length scale: 1 unit = 1 million km (Mm)
+const DEG2RAD = Math.PI / 180;
+
+// ===================================================================
+// CPU-side: planets + view-related state
+// ===================================================================
+class PlanetarySystem {
+  constructor(cfg) {
+    this.dt = cfg.DELTA_T;
+    this.time = 0;
+    this.steps = 0;
+    const n = cfg.PLANETS.length;
+    this.nP = n;
+    this.plX  = new Float64Array(n);
+    this.plY  = new Float64Array(n);
+    this.plOX = new Float64Array(n);
+    this.plOY = new Float64Array(n);
+    this.plVX = new Float64Array(n);
+    this.plVY = new Float64Array(n);
+    this.plAX = new Float64Array(n);
+    this.plAY = new Float64Array(n);
+    this.plMass = new Float64Array(n);
+    this.plRad  = new Float64Array(n);
+    this.plName = [];
+    this.plColorCss = [];
+
+    for (let i = 0; i < n; ++i) {
+      const p = cfg.PLANETS[i];
+      this.plName.push(p.name);
+      this.plColorCss.push(p.css);
+      this.plMass[i] = p.mass;
+      this.plRad[i]  = p.rad;
+      if (p.orbit) {
+        const j = this.plName.indexOf(p.orbit.around);
+        const elon = p.orbit.elonDeg * DEG2RAD;
+        const x = p.orbit.dist * Math.sin(elon);
+        const y = p.orbit.dist * Math.cos(elon);
+        this.plX[i] = x;
+        this.plY[i] = y;
+        const v = this._orbitalVel(j, x, y);
+        this.plVX[i] = v.vx;
+        this.plVY[i] = v.vy;
+      }
+    }
+    for (let i = 0; i < n; ++i) {
+      this.plOX[i] = this.plX[i] - this.dt * this.plVX[i];
+      this.plOY[i] = this.plY[i] - this.dt * this.plVY[i];
+    }
+  }
+
+  _orbitalVel(idx, x, y) {
+    const rx = x - this.plX[idx], ry = y - this.plY[idx];
+    const d = Math.sqrt(rx * rx + ry * ry);
+    const v = Math.sqrt(GAMMA * this.plMass[idx] / d);
+    return { vx: ( ry / d) * v, vy: (-rx / d) * v };
+  }
+
+  // Verlet step for the few planets (mutual N-body, exact).
+  movePlanets() {
+    const n = this.nP, ax = this.plAX, ay = this.plAY;
+    for (let i = 0; i < n; ++i) { ax[i] = 0; ay[i] = 0; }
+    for (let i = 0; i < n; ++i) {
+      for (let j = i + 1; j < n; ++j) {
+        const rx = this.plX[i] - this.plX[j];
+        const ry = this.plY[i] - this.plY[j];
+        const d2 = rx * rx + ry * ry;
+        const d  = Math.sqrt(d2);
+        const k  = -GAMMA * this.plMass[i] * this.plMass[j] / (d2 * d);
+        const fx = k * rx, fy = k * ry;
+        ax[i] += fx / this.plMass[i];
+        ay[i] += fy / this.plMass[i];
+        ax[j] -= fx / this.plMass[j];
+        ay[j] -= fy / this.plMass[j];
+      }
+    }
+    const dt2 = this.dt * this.dt;
+    for (let i = 0; i < n; ++i) {
+      const bx = this.plX[i], by = this.plY[i];
+      this.plX[i] = 2 * bx - this.plOX[i] + ax[i] * dt2;
+      this.plY[i] = 2 * by - this.plOY[i] + ay[i] * dt2;
+      this.plOX[i] = bx;
+      this.plOY[i] = by;
+    }
+    this.time += this.dt;
+    this.steps += 1;
+  }
+}
+
+// ===================================================================
+// GPU compute: tracer integration via transform feedback
+// ===================================================================
+function compileShader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+    throw new Error("Shader compile error:\n" + gl.getShaderInfoLog(sh));
+  return sh;
+}
+function linkProgram(gl, vs, fs, tfVaryings) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  if (tfVaryings) gl.transformFeedbackVaryings(p, tfVaryings, gl.SEPARATE_ATTRIBS);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error("Program link error:\n" + gl.getProgramInfoLog(p));
+  return p;
+}
+function shaderSrc(id) { return document.getElementById(id).textContent.trim(); }
+
+class GPUSimulation {
+  constructor(gl, sys, n) {
+    this.gl = gl;
+    this.sys = sys;
+    this.n = n;
+    this.read = 0;
+    this.stepSeed = 0;
+    this.eccGate  = 0.75;   // perihelion/aphelion cutoff for the kill gate
+    this.prScale  = 0;      // unitless dial for Poynting-Robertson drag (0 = off)
+
+    // Compile programs.
+    const vsInt = compileShader(gl, gl.VERTEX_SHADER,   shaderSrc("vs-integrate"));
+    const fsInt = compileShader(gl, gl.FRAGMENT_SHADER, shaderSrc("fs-integrate"));
+    const vsRen = compileShader(gl, gl.VERTEX_SHADER,   shaderSrc("vs-render"));
+    const fsRen = compileShader(gl, gl.FRAGMENT_SHADER, shaderSrc("fs-render"));
+    this.intProg = linkProgram(gl, vsInt, fsInt, ["v_pos", "v_vel", "v_stats", "v_size"]);
+    this.renProg = linkProgram(gl, vsRen, fsRen, null);
+
+    // Cache uniform locations.
+    this.intU = {
+      planetPos:    gl.getUniformLocation(this.intProg, "u_planetPos[0]"),
+      planetMass:   gl.getUniformLocation(this.intProg, "u_planetMass[0]"),
+      planetRadX10: gl.getUniformLocation(this.intProg, "u_planetRadX10[0]"),
+      numPlanets:   gl.getUniformLocation(this.intProg, "u_numPlanets"),
+      Kv:           gl.getUniformLocation(this.intProg, "u_Kv"),
+      V0Sun:        gl.getUniformLocation(this.intProg, "u_V0Sun"),
+      dt:           gl.getUniformLocation(this.intProg, "u_dt"),
+      Rmin:         gl.getUniformLocation(this.intProg, "u_Rmin"),
+      Rmax:         gl.getUniformLocation(this.intProg, "u_Rmax"),
+      seed:         gl.getUniformLocation(this.intProg, "u_seed"),
+      eccGate:      gl.getUniformLocation(this.intProg, "u_eccGate"),
+      prCoef:       gl.getUniformLocation(this.intProg, "u_prCoef"),
+    };
+    this.renU = {
+      centerPos: gl.getUniformLocation(this.renProg, "u_centerPos"),
+      invFov:    gl.getUniformLocation(this.renProg, "u_invFov"),
+      rot:       gl.getUniformLocation(this.renProg, "u_rot"),
+    };
+
+    // Annulus bounds (scaled).
+    this.Rmin = (this.sys.plRad[0] * 20) / L;        // sun keep-out
+    this.Rmax = CONFIG.DISK_RADIUS / L;
+
+    // Allocate ping-pong state buffers (sized but contents replaced
+    // immediately below).
+    const empty = new Float32Array(n * 2);
+    const empty1 = new Float32Array(n);
+    this.states = [
+      this._createState(empty, empty, empty, empty1),
+      this._createState(empty, empty, empty, empty1),
+    ];
+    // Identical to what 'R' does: re-upload fresh initial data into
+    // every buffer after TF bindings exist. Doing it this way at boot
+    // sidesteps a driver issue where TF dispatches were no-ops until
+    // a bufferData on a TF-bound buffer "primed" things.
+    this.resetDisk();
+  }
+
+  // Uniform area density in the annulus [Rmin, Rmax]: pick r from
+  // sqrt(Rmin^2 + u*(Rmax^2 - Rmin^2)). The CPU-side initial state and
+  // the GPU-side reset both use this distribution so the disk stays
+  // statistically uniform across resets.
+  _initTracerData(pos, vel, stats, size) {
+    const sunXkm = this.sys.plX[0], sunYkm = this.sys.plY[0];
+    const RminKm = this.Rmin * L, RmaxKm = this.Rmax * L;
+    const Rmin2 = RminKm * RminKm, Rmax2 = RmaxKm * RmaxKm;
+    for (let i = 0; i < this.n; ++i) {
+      const u = Math.random();
+      const dKm = Math.sqrt(Rmin2 + u * (Rmax2 - Rmin2));
+      const elon = 2 * Math.PI * Math.random();
+      const xKm = sunXkm + dKm * Math.cos(elon);
+      const yKm = sunYkm + dKm * Math.sin(elon);
+      const v   = this.sys._orbitalVel(0, xKm, yKm); // km/s
+      pos[2*i]     = xKm / L;
+      pos[2*i + 1] = yKm / L;
+      vel[2*i]     = v.vx / L;       // km/s -> Mm/s
+      vel[2*i + 1] = v.vy / L;
+      stats[2*i]     = 1e9;
+      stats[2*i + 1] = 0;
+      size[i]        = Math.random();   // uniform grain "size" in [0,1]
+    }
+  }
+
+  _createState(initPos, initVel, initStats, initSize) {
+    const gl = this.gl;
+    const mkBuf = (data) => {
+      const b = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_COPY);
+      return b;
+    };
+    const posBuf   = mkBuf(initPos);
+    const velBuf   = mkBuf(initVel);
+    const statsBuf = mkBuf(initStats);
+    const sizeBuf  = mkBuf(initSize);
+
+    const intVAO = gl.createVertexArray();
+    gl.bindVertexArray(intVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, velBuf);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, statsBuf);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuf);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+
+    const renVAO = gl.createVertexArray();
+    gl.bindVertexArray(renVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuf);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+
+    const tf = gl.createTransformFeedback();
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, posBuf);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, velBuf);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 2, statsBuf);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 3, sizeBuf);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+
+    return { posBuf, velBuf, statsBuf, sizeBuf, intVAO, renVAO, tf };
+  }
+
+  step() {
+    // Planets first (CPU).
+    this.sys.movePlanets();
+    this.stepSeed += 1;
+
+    const gl = this.gl;
+    const sys = this.sys;
+    const writeIdx = 1 - this.read;
+
+    gl.useProgram(this.intProg);
+
+    // Pack planet uniforms (scaled).
+    const planetPos = new Float32Array(8 * 2);
+    const planetMass = new Float32Array(8);
+    const planetRadX10 = new Float32Array(8);
+    for (let i = 0; i < sys.nP; ++i) {
+      planetPos[2*i]     = sys.plX[i] / L;
+      planetPos[2*i + 1] = sys.plY[i] / L;
+      planetMass[i]      = sys.plMass[i];
+      planetRadX10[i]    = (sys.plRad[i] * 10) / L;
+    }
+    gl.uniform2fv(this.intU.planetPos,    planetPos);
+    gl.uniform1fv(this.intU.planetMass,   planetMass);
+    gl.uniform1fv(this.intU.planetRadX10, planetRadX10);
+    gl.uniform1i(this.intU.numPlanets, sys.nP);
+
+    // Kv = -G * dt / L^3  (per-step velocity kick coefficient; sign baked in).
+    const Kv = -GAMMA * sys.dt / (L * L * L);
+    gl.uniform1f(this.intU.Kv, Kv);
+    // V0 such that v_scaled = V0 / sqrt(d_scaled) gives circular orbital v.
+    const V0 = Math.sqrt(GAMMA * sys.plMass[0] / (L * L * L));
+    gl.uniform1f(this.intU.V0Sun, V0);
+    gl.uniform1f(this.intU.dt, sys.dt);
+    gl.uniform1f(this.intU.Rmin, this.Rmin);
+    gl.uniform1f(this.intU.Rmax, this.Rmax);
+    gl.uniform1f(this.intU.seed, this.stepSeed);
+    gl.uniform1f(this.intU.eccGate, this.eccGate);
+    // Poynting-Robertson coefficient: GM_sun*dt/(c*L^2), times the user
+    // dial. Speed of light c = 299792.458 km/s.
+    const C_KMS = 299792.458;
+    const prCoefBase = (GAMMA * sys.plMass[0] * sys.dt) / (C_KMS * L * L);
+    gl.uniform1f(this.intU.prCoef, this.prScale * prCoefBase);
+
+    gl.bindVertexArray(this.states[this.read].intVAO);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, this.states[writeIdx].tf);
+    gl.enable(gl.RASTERIZER_DISCARD);
+    gl.beginTransformFeedback(gl.POINTS);
+    gl.drawArrays(gl.POINTS, 0, this.n);
+    gl.endTransformFeedback();
+    gl.disable(gl.RASTERIZER_DISCARD);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+    gl.bindVertexArray(null);
+
+    // Force the driver to actually execute submitted work. Without this
+    // some drivers were sitting on the TF dispatch indefinitely until
+    // something else (a bufferSubData from a click, etc.) triggered a
+    // sync, which is what made tracers "need a click to start".
+    gl.flush();
+
+    if (this._checkError !== false) {
+      const err = gl.getError();
+      if (err) { this.lastGlError = err; this._checkError = false; }
+      else if (this.stepSeed > 4) this._checkError = false;
+    }
+
+    this.read = writeIdx;
+  }
+
+  render(centerWorldX, centerWorldY, fovKm, rotCos, rotSin) {
+    const gl = this.gl;
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(this.renProg);
+    gl.uniform2f(this.renU.centerPos, centerWorldX / L, centerWorldY / L);
+    const fovScaled = fovKm / L;
+    gl.uniform2f(this.renU.invFov, 2 / fovScaled, 2 / fovScaled);
+    gl.uniform2f(this.renU.rot, rotCos, rotSin);
+
+    // Additive blending: stacked tracers brighten the pixel without
+    // clipping, so dense Trojan/resonance clumps glow naturally.
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    gl.bindVertexArray(this.states[this.read].renVAO);
+    gl.drawArrays(gl.POINTS, 0, this.n);
+    gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
+  }
+
+  // Inject a tracer at world (km) coords with circular-orbit velocity
+  // around `centerIdx`. Writes one slot in the current "read" buffers
+  // (which the next integration step will consume).
+  injectTracer(xKm, yKm, centerIdx) {
+    if (this._injIdx === undefined) this._injIdx = 0;
+    this._injIdx = (this._injIdx + 1) % this.n;
+    const i = this._injIdx;
+
+    const v = this.sys._orbitalVel(centerIdx, xKm, yKm);
+    const xs = xKm / L, ys = yKm / L;
+    const vxs = v.vx / L, vys = v.vy / L;
+
+    const gl = this.gl;
+    const st = this.states[this.read];
+    const tmp = new Float32Array([xs, ys]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.posBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp);
+    tmp[0] = vxs; tmp[1] = vys;
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.velBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp);
+    // Reset stats so the eccentricity gate doesn't fire on stale data.
+    const tmp2 = new Float32Array([1e9, 0]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.statsBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, i * 8, tmp2);
+    // Pick a random size for the injected tracer.
+    const tmp3 = new Float32Array([Math.random()]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.sizeBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, i * 4, tmp3);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+
+  // Re-randomise the disk by re-uploading initial data to both states.
+  resetDisk() {
+    const initPos   = new Float32Array(this.n * 2);
+    const initVel   = new Float32Array(this.n * 2);
+    const initStats = new Float32Array(this.n * 2);
+    const initSize  = new Float32Array(this.n);
+    this._initTracerData(initPos, initVel, initStats, initSize);
+    const gl = this.gl;
+    for (const st of this.states) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.posBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, initPos, gl.DYNAMIC_COPY);
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.velBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, initVel, gl.DYNAMIC_COPY);
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.statsBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, initStats, gl.DYNAMIC_COPY);
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.sizeBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, initSize, gl.DYNAMIC_COPY);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+}
+
+// ===================================================================
+// Canvas2D overlay: axes, planets, resonance, solar system, text
+// ===================================================================
+class OverlayRenderer {
+  constructor(canvas, sys) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.sys = sys;
+    this.w = canvas.width;
+    this.h = canvas.height;
+    this.cx = this.w >> 1;
+    this.cy = this.h >> 1;
+    this.fov = 2e9;
+    this.center = 0;
+    // Default to co-rotating with Jupiter (last planet) if present.
+    this.coRotateIdx = sys.nP > 2 ? 2 : (sys.nP > 1 ? 1 : -1);
+    this.resonance = 0;
+    this.showSolarSystem = false;
+    this.contSource = false;
+    this.contX = 0; this.contY = 0;
+    this.stepsPerFrame = 150;
+    this.fpsFrames = 0;
+    this.fpsT0 = performance.now();
+    this.frameFps = 0;
+  }
+  get scale() { return this.w / this.fov; }
+
+  // Cycle: off -> 1 -> 2 -> ... -> nP-1 -> off. Skip Sun (idx 0): a
+  // rotation around the Sun in the Sun's frame is meaningless.
+  cycleCoRotate() {
+    if (this.coRotateIdx < 0) {
+      this.coRotateIdx = this.sys.nP > 1 ? 1 : -1;
+    } else {
+      this.coRotateIdx = (this.coRotateIdx + 1 < this.sys.nP) ? this.coRotateIdx + 1 : -1;
+    }
+  }
+
+  // (cos a, sin a) where a = -theta and theta is the angle of the
+  // co-rotation target around the Sun. Multiplying world offsets by
+  // this rotation places the target on the +x axis relative to the Sun.
+  getRotation() {
+    if (this.coRotateIdx <= 0) return { c: 1, s: 0 };
+    const sys = this.sys;
+    const dx = sys.plX[this.coRotateIdx] - sys.plX[0];
+    const dy = sys.plY[this.coRotateIdx] - sys.plY[0];
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-9) return { c: 1, s: 0 };
+    return { c: dx / d, s: -dy / d };
+  }
+
+  // World position the camera is anchored to. In co-rotation mode,
+  // anchor on the Sun so it stays at screen center while the chosen
+  // body sits on the +x axis (and the L4/L5 region is symmetric).
+  getEffectiveCenter() {
+    if (this.coRotateIdx > 0) {
+      return { x: this.sys.plX[0], y: this.sys.plY[0] };
+    }
+    return { x: this.sys.plX[this.center], y: this.sys.plY[this.center] };
+  }
+
+  worldToScreen(x, y) {
+    const sc = this.scale;
+    const c = this.getEffectiveCenter();
+    const dx = x - c.x;
+    const dy = y - c.y;
+    const r = this.getRotation();
+    const rx = dx * r.c - dy * r.s;
+    const ry = dx * r.s + dy * r.c;
+    return { x: this.cx + rx * sc, y: this.cy + ry * sc };
+  }
+  setCenter(idx) { if (idx >= 0 && idx < this.sys.nP) this.center = idx; }
+  toggleResonance(idx) { if (idx >= 0 && idx < this.sys.nP) this.resonance ^= (1 << idx); }
+  zoom(f) { this.fov *= f; }
+
+  render(simStepsPerSec) {
+    const ctx = this.ctx;
+    ctx.clearRect(0, 0, this.w, this.h);
+
+    this._drawAxes();
+    this._drawPlanets();
+    for (let i = 0; i < this.sys.nP; ++i) {
+      if (this.resonance & (1 << i)) this._drawResonance(i);
+    }
+    if (this.showSolarSystem) this._drawSolarSystem();
+    this._drawStat(simStepsPerSec);
+  }
+
+  _drawAxes() {
+    const ctx = this.ctx;
+    ctx.strokeStyle = "rgba(68,68,170,1)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(this.cx + 0.5, 0); ctx.lineTo(this.cx + 0.5, this.h);
+    ctx.moveTo(0, this.cy + 0.5); ctx.lineTo(this.w, this.cy + 0.5);
+    ctx.stroke();
+  }
+
+  _drawPlanets() {
+    const s = this.sys, ctx = this.ctx;
+    for (let i = 0; i < s.nP; ++i) {
+      const p = this.worldToScreen(s.plX[i], s.plY[i]);
+      if (p.x < 0 || p.x > this.w || p.y < 0 || p.y > this.h) continue;
+      const col = s.plColorCss[i];
+      ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y - 15); ctx.lineTo(p.x, p.y + 15);
+      ctx.moveTo(p.x - 15, p.y); ctx.lineTo(p.x + 15, p.y);
+      ctx.stroke();
+      const r = Math.max(1, s.plRad[i] * this.scale);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  _drawSolarSystem() {
+    const cols = ["rgba(255,255,255,1)","rgba(251,230,111,1)","rgba(0,123,98,1)",
+                  "rgba(242,98,42,1)","rgba(255,97,35,1)","rgba(255,216,0,1)",
+                  "rgba(101,144,255,1)","rgba(5,54,178,1)"];
+    const dist = [57910000,108210000,149600000,227920000,
+                  778570000,1433530000,2872460000,4495060000];
+    const names = ["Mercury","Venus","Earth","Mars","Jupiter","Saturn","Uranus","Neptune"];
+    const ctx = this.ctx, s = this.sys;
+    const sun = this.worldToScreen(s.plX[0], s.plY[0]);
+    const cx = sun.x, cy = sun.y;
+    ctx.lineWidth = 1; ctx.font = "11px Consolas, monospace";
+    for (let i = 0; i < dist.length; ++i) {
+      const r = dist[i] * this.scale;
+      ctx.strokeStyle = cols[i]; ctx.fillStyle = cols[i];
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI); ctx.stroke();
+      ctx.fillText(names[i], cx, cy + r - 2);
+    }
+  }
+
+  _drawResonance(idx) {
+    const s = this.sys, ctx = this.ctx, idxMain = 0;
+    const rx = s.plX[idxMain] - s.plX[idx];
+    const ry = s.plY[idxMain] - s.plY[idx];
+    const dist = Math.sqrt(rx * rx + ry * ry);
+    const v = Math.sqrt(GAMMA * s.plMass[idxMain] / dist);
+    const period = 2 * Math.PI * dist / v;
+    const ratios = [1, 1/2, 1/3, 1/4, 2/3, 2/5];
+    const names  = [" 1:1"," 2:1"," 3:1"," 4:1"," 3:2"," 5:2"];
+    const G_SI = 6.67428e-11;
+    const main = this.worldToScreen(s.plX[idxMain], s.plY[idxMain]);
+    const cx = main.x, cy = main.y;
+    ctx.strokeStyle = s.plColorCss[idx]; ctx.fillStyle = s.plColorCss[idx];
+    ctx.lineWidth = 1; ctx.font = "11px Consolas, monospace";
+    for (let i = 0; i < ratios.length; ++i) {
+      const T = period * ratios[i];
+      const radKm = Math.cbrt(G_SI * s.plMass[idxMain] * T * T / (4 * Math.PI * Math.PI)) / 1000;
+      const rPx = radKm * this.scale;
+      ctx.beginPath(); ctx.arc(cx, cy, rPx, 0, 2 * Math.PI); ctx.stroke();
+      ctx.fillText(names[i], cx, cy - rPx - 4);
+    }
+  }
+
+  _drawStat(simStepsPerSec) {
+    const s = this.sys, ctx = this.ctx;
+    ctx.font = "12px Consolas, monospace";
+    ctx.fillStyle = "#fff";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    const yr = s.time / (86400 * 365.25);
+    const lines = [
+      "Tracers: " + CONFIG.NUM_TRACERS.toLocaleString() + "  (GPU)",
+      "Total time: " + yr.toFixed(2) + " yr",
+      "Steps per second: " + Math.round(simStepsPerSec),
+      "Render FPS: " + Math.round(this.frameFps),
+      "Steps/frame: " + this.stepsPerFrame,
+      "Center: " + s.plName[this.center] + "   FOV: " + this.fov.toExponential(2) + " km",
+      "Co-rotate: " + (this.coRotateIdx < 0 ? "off (inertial)" : s.plName[this.coRotateIdx]),
+    ];
+    if (simStepsPerSec > 0) {
+      const usPer = 1e6 / (simStepsPerSec * CONFIG.NUM_TRACERS);
+      lines.push("Time per tracer: " + usPer.toPrecision(2) + " us");
+    }
+    for (let i = 0; i < lines.length; ++i) ctx.fillText(lines[i], 12, 12 + 15 * i);
+    if (this.resonance) {
+      let txt = "Resonances: ";
+      for (let i = 0; i < s.nP; ++i)
+        if (this.resonance & (1 << i)) txt += s.plName[i] + " ";
+      ctx.fillText(txt, 12, 12 + 15 * lines.length);
+    }
+    if (sim && sim.lastGlError) {
+      ctx.fillStyle = "#f88";
+      ctx.fillText("GL error 0x" + sim.lastGlError.toString(16),
+                   12, this.h - 16);
+    }
+  }
+
+  bumpFrame() {
+    this.fpsFrames += 1;
+    const now = performance.now();
+    const dt = now - this.fpsT0;
+    if (dt > 1000) {
+      this.frameFps = this.fpsFrames * 1000 / dt;
+      this.fpsFrames = 0;
+      this.fpsT0 = now;
+    }
+  }
+}
+
+// ===================================================================
+// Wire it up
+// ===================================================================
+const glCanvas = document.getElementById("gl");
+const cvCanvas = document.getElementById("cv");
+const gl = glCanvas.getContext("webgl2", { antialias: false, preserveDrawingBuffer: false });
+if (!gl) {
+  document.getElementById("fallback").style.display = "block";
+  throw new Error("WebGL2 not available");
+}
+
+const sys = new PlanetarySystem(CONFIG);
+const sim = new GPUSimulation(gl, sys, CONFIG.NUM_TRACERS);
+const overlay = new OverlayRenderer(cvCanvas, sys);
+
+// --- input ---------------------------------------------------------
+cvCanvas.addEventListener("mousedown", (e) => {
+  const rect = cvCanvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  // Screen pixel -> rotated-world offset, then invert the rotation to
+  // get the inertial offset, then add the centered body's position.
+  const sx = (px - overlay.cx) * overlay.fov / overlay.w;
+  const sy = (py - overlay.cy) * overlay.fov / overlay.h;
+  const r = overlay.getRotation();
+  const dx =  sx * r.c + sy * r.s;
+  const dy = -sx * r.s + sy * r.c;
+  const c = overlay.getEffectiveCenter();
+  const wx = dx + c.x;
+  const wy = dy + c.y;
+  sim.injectTracer(wx, wy, overlay.center);
+  overlay.contX = wx; overlay.contY = wy;
+});
+
+// Eccentricity-gate slider: applies on the next step (no reset needed).
+const eccSlider = document.getElementById("eccSlider");
+const eccVal = document.getElementById("eccVal");
+function updateEccLabel() {
+  const x = sim.eccGate;
+  // exc = (1-e)/(1+e)  =>  e = (1-exc)/(1+exc).
+  const e = (1 - x) / (1 + x);
+  eccVal.textContent = (x === 0)
+    ? "0.00 (off)"
+    : x.toFixed(2) + " (e≈" + e.toFixed(2) + ")";
+}
+eccSlider.value = sim.eccGate;
+updateEccLabel();
+eccSlider.addEventListener("input", () => {
+  sim.eccGate = parseFloat(eccSlider.value);
+  updateEccLabel();
+});
+
+// PR-drag slider. Maps the 0..2000 widget range into a unitless prScale
+// such that values around 100-500 give visible spiral-in over a few
+// minutes of wall-clock time at the default step rate.
+const prSlider = document.getElementById("prSlider");
+const prVal    = document.getElementById("prVal");
+function updatePrLabel() {
+  const v = sim.prScale;
+  prVal.textContent = v === 0 ? "off" : v.toFixed(0);
+}
+prSlider.value = sim.prScale;
+updatePrLabel();
+prSlider.addEventListener("input", () => {
+  sim.prScale = parseFloat(prSlider.value);
+  updatePrLabel();
+});
+
+window.addEventListener("keydown", (e) => {
+  switch (e.key) {
+    case "+": case "=":  overlay.zoom(1.2); break;
+    case "-": case "_":  overlay.zoom(1 / 1.2); break;
+    case "s": case "S":  overlay.showSolarSystem = !overlay.showSolarSystem; break;
+    case "c": case "C":  overlay.contSource = !overlay.contSource; break;
+    case "1": overlay.setCenter(0); break;
+    case "2": overlay.setCenter(1); break;
+    case "3": overlay.setCenter(2); break;
+    case "4": overlay.setCenter(3); break;
+    case "F1": overlay.toggleResonance(0); e.preventDefault(); break;
+    case "F2": overlay.toggleResonance(1); e.preventDefault(); break;
+    case "F3": overlay.toggleResonance(2); e.preventDefault(); break;
+    case "F4": overlay.toggleResonance(3); e.preventDefault(); break;
+    case "[":  overlay.stepsPerFrame = Math.max(1, overlay.stepsPerFrame - 1); break;
+    case "]":  overlay.stepsPerFrame += 1; break;
+    case "t": case "T": overlay.cycleCoRotate(); break;
+    case "r": case "R": sim.resetDisk(); break;
+  }
+});
+
+// --- main loop -----------------------------------------------------
+let stepsLastSec = 0, stepsAcc = 0, stepsT0 = performance.now();
+function loop() {
+  for (let i = 0; i < overlay.stepsPerFrame; ++i) {
+    if (overlay.contSource) sim.injectTracer(overlay.contX, overlay.contY, overlay.center);
+    sim.step();
+    stepsAcc += 1;
+  }
+  const now = performance.now();
+  if (now - stepsT0 > 1000) {
+    stepsLastSec = stepsAcc * 1000 / (now - stepsT0);
+    stepsAcc = 0;
+    stepsT0 = now;
+  }
+  const rot = overlay.getRotation();
+  const c = overlay.getEffectiveCenter();
+  sim.render(c.x, c.y, overlay.fov, rot.c, rot.s);
+  overlay.render(stepsLastSec);
+  overlay.bumpFrame();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
